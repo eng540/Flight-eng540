@@ -15,12 +15,10 @@ CHANGES FROM v3.0:
                         Evidence: IngestionJobResponse in schemas.py references
                         all these fields → ValidationError crash without them.
 """
+from sqlalchemy import (
+    Column, Integer, String, Float, DateTime, ForeignKey,
+    Boolean, Index, BigInteger, Text, Date, UniqueConstraint
 )
-from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy import UniqueConstraint
-from app.database import Base
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from sqlalchemy.dialects.postgresql import JSONB
