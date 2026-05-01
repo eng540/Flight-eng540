@@ -1,0 +1,44 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Flight Intelligence – Standalone Worker
+#
+# Run the Celery worker on YOUR machine (residential/VPS IP) while the
+# Railway backend handles the API and database.
+#
+# This solves the OpenSky IP-blocking problem:
+#   - Railway (cloud IP) → BLOCKED by OpenSky
+#   - Your machine (residential/VPS IP) → ALLOWED by OpenSky
+#
+# Setup:
+#   1. Copy .env.worker.example to .env.worker and fill in your Railway URLs
+#   2. docker compose -f docker-compose.worker.yml up -d
+# ═══════════════════════════════════════════════════════════════════════════════
+version: "3.8"
+
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: flight-worker-local
+    env_file: .env.worker
+    restart: unless-stopped
+    volumes:
+      - /tmp/celerybeat:/tmp/celerybeat
+    command: >
+      celery -A worker.celery_app worker
+        -l info
+        -Q ingestion,maintenance,default
+        --concurrency=2
+        --without-gossip
+        --without-mingle
+
+  beat:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: flight-beat-local
+    env_file: .env.worker
+    restart: unless-stopped
+    volumes:
+      - /tmp/celerybeat:/tmp/celerybeat
+    command: celery -A worker.celery_app beat -l info

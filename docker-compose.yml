@@ -1,0 +1,173 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# منصة استخبارات الطيران — Flight Intelligence Platform
+# docker-compose.yml — Production Grade
+#
+# الخدمات / Services:
+#   postgres   — قاعدة البيانات الرئيسية (PostgreSQL 16)
+#   redis      — طابور المهام + Cache (Redis 7)
+#   backend    — FastAPI API server
+#   worker     — Celery worker (ingestion + maintenance queues)
+#   beat       — Celery beat scheduler (periodic tasks)
+#   frontend   — React SPA via nginx (port 80)
+#
+# الاستخدام / Usage:
+#   cp .env.example .env        # ← edit FR24_API_KEY
+#   docker compose up -d
+#   docker compose logs -f backend
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-backend-env: &backend-env
+  DATABASE_URL:           ${DATABASE_URL:-postgresql://flightuser:flightpass@postgres:5432/flightdb}
+  REDIS_URL:              ${REDIS_URL:-redis://redis:6379/0}
+  FR24_API_KEY:           ${FR24_API_KEY}
+  FR24_BASE_URL:          ${FR24_BASE_URL:-https://fr24api.flightradar24.com}
+  DATA_RETENTION_DAYS:    ${DATA_RETENTION_DAYS:-30}
+  ACTIVE_REGIONS:         ${ACTIVE_REGIONS:-middle_east,north_africa,central_asia}
+  ENVIRONMENT:            ${ENVIRONMENT:-production}
+  SECRET_KEY:             ${SECRET_KEY:-change-me-in-production}
+  INGESTION_DELAY_SECONDS: ${INGESTION_DELAY_SECONDS:-10}
+
+services:
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-flightuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-flightpass}
+      POSTGRES_DB:       ${POSTGRES_DB:-flightdb}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-flightuser} -d ${POSTGRES_DB:-flightdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── Backend — FastAPI ──────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      # Mount alembic for migration runs from host
+      - ./backend/alembic:/app/alembic:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/stats/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    # Run migrations then start server
+    command: >
+      sh -c "
+        echo '[startup] Running Alembic migrations…' &&
+        alembic upgrade head &&
+        echo '[startup] Migrations complete. Starting API server…' &&
+        uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
+      "
+
+  # ── Celery Worker (ingestion + maintenance) ────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: ./worker/Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    command: >
+      celery -A worker.celery_app:celery_app worker
+      --queues=ingestion,maintenance
+      --loglevel=info
+      --concurrency=2
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ── Celery Beat (periodic task scheduler) ─────────────────────────────────
+  beat:
+    build:
+      context: .
+      dockerfile: ./worker/Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A worker.celery_app:celery_app beat
+      --loglevel=info
+      --schedule=/tmp/celerybeat-schedule
+    # Only one beat instance should ever run
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  # ── Frontend — React + nginx ───────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${FRONTEND_PORT:-80}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  postgres_data:
+    name: flight_postgres_data
+  redis_data:
+    name: flight_redis_data
+
+networks:
+  default:
+    name: flight_network
