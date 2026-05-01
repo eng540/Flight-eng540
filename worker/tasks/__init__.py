@@ -19,6 +19,7 @@ FIXES FROM v2.0:
   [NO CHANGE] ingest_historical_flights — correct, uses ingest_date_range_for_region.
   [NO CHANGE] Legacy stubs preserved (prevents Celery beat errors).
 """
+from . import operations_task
 from celery import shared_task
 from celery.exceptions import MaxRetriesExceededError, SoftTimeLimitExceeded
 import logging
