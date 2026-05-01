@@ -1,5 +1,5 @@
 /**
- * OperationsBoard.tsx — v1.0 (Operations Board UI)
+ * OperationsBoard.tsx — v1.1 (Operations Board UI)
  *
  * "قمرة القيادة" — translates complex FR24 capabilities into
  * a simple Arabic wizard: select → configure → review → launch → track.
@@ -21,6 +21,10 @@
  *               ICAO must be 3 uppercase letters before preflight request.
  *               Evidence: FR24 error "The provided airline code 'SL'
  *               is not a valid airline ICAO code"
+ *   [FIX-FS-UI] flight_summaries now shows an optional airline ICAO field.
+ *               Allows user to specify airline when region airports are unavailable.
+ *               Field is optional — if left empty, backend will try to use region airports.
+ *               Evidence: ValueError "flight_summaries requires an additional filter"
  */
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -114,7 +118,13 @@ const CAPABILITIES = [
     title: 'ملخصات الرحلات',
     desc: 'كل الرحلات في فترة زمنية محددة',
     timing: '📅 تاريخي',
-    needsDates: true, needsEntity: false,
+    needsDates: true,
+    // [FIX-FS-UI] Made entity optional for flight_summaries.
+    // When provided, it passes airline_icao to FR24.
+    // When empty, backend will try to use region airports.
+    needsEntity: true,
+    entityLabel: 'رمز الناقل ICAO (اختياري، مثال: UAE)',
+    entityOptional: true,
   },
   {
     id: 'flight_tracks',
@@ -133,14 +143,6 @@ const CAPABILITIES = [
     needsDates: true, needsEntity: false,
   },
   // [FIX-HE-UI] historic_events removed from UI until backend supports required params
-  // {
-  //   id: 'historic_events',
-  //   icon: '⚡',
-  //   title: 'أحداث تاريخية',
-  //   desc: 'طوارئ وأحداث غير اعتيادية',
-  //   timing: '📅 تاريخي',
-  //   needsDates: true, needsEntity: false,
-  // },
   {
     id: 'static_airport',
     icon: '🏢',
@@ -248,6 +250,16 @@ export function OperationsBoard() {
       const icao = entityId.trim().toUpperCase();
       if (icao.length !== 3 || !/^[A-Z]{3}$/.test(icao)) {
         setError('رمز ICAO يجب أن يكون 3 أحرف (مثال: UAE، SVA)');
+        setSubmitting(false);
+        return;
+      }
+    }
+
+    // [FIX-FS-UI] Validate flight_summaries airline ICAO if provided
+    if (capability === 'flight_summaries' && entityId) {
+      const icao = entityId.trim().toUpperCase();
+      if (icao.length > 0 && (icao.length !== 3 || !/^[A-Z]{3}$/.test(icao))) {
+        setError('رمز ICAO يجب أن يكون 3 أحرف (مثال: UAE، SVA) أو يُترك فارغاً');
         setSubmitting(false);
         return;
       }
@@ -434,6 +446,27 @@ export function OperationsBoard() {
                       <Input placeholder="أدخل المعرّف..."
                         value={entityId}
                         onChange={e => setEntityId(e.target.value)} />
+                      {/* [FIX-FS-UI] Show optional hint for flight_summaries */}
+                      {(capability === 'flight_summaries') && (
+                        <p className="text-xs text-muted-foreground">
+                          يمكنك تركه فارغاً لاستخدام مطارات المنطقة تلقائياً
+                        </p>
+                      )}
+                    </div>
+                  )}
+
+                  {/* [FIX-FS-UI] Region selector also shown for flight_summaries */}
+                  {(capability === 'flight_summaries') && (
+                    <div className="space-y-1">
+                      <Label className="text-xs">المنطقة الجغرافية</Label>
+                      <Select value={regionKey} onValueChange={setRegionKey}>
+                        <SelectTrigger><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          {REGIONS.map(r => (
+                            <SelectItem key={r.key} value={r.key}>{r.label}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
                     </div>
                   )}
 
@@ -442,7 +475,7 @@ export function OperationsBoard() {
                   )}
 
                   <Button onClick={submitForPreflight}
-                    disabled={submitting || (capMeta.needsEntity && !entityId)}
+                    disabled={submitting || (capMeta.needsEntity && !(capMeta as any).entityOptional && !entityId)}
                     className="w-full">
                     {submitting ? '⏳ جاري الحساب…' : '📋 احسب التكلفة'}
                   </Button>
