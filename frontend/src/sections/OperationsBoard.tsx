@@ -11,6 +11,16 @@
  * All text Arabic. Calls /api/v1/operations/* exclusively.
  * Polling: GET /api/v1/operations/{id}/progress every 3 seconds.
  * Evidence: system design §5 Execution Flow + §6 Partial Results
+ *
+ * FIXES APPLIED (2026-05-01):
+ *   [FIX-HE-UI] Removed historic_events from capability cards until backend
+ *               supports required params (flight_ids + event_types).
+ *               Evidence: FR24 error "The flight ids field is required.,
+ *               The event types field is required."
+ *   [FIX-SA-UI] Added client-side validation for static_airline ICAO codes.
+ *               ICAO must be 3 uppercase letters before preflight request.
+ *               Evidence: FR24 error "The provided airline code 'SL'
+ *               is not a valid airline ICAO code"
  */
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -122,14 +132,15 @@ const CAPABILITIES = [
     timing: '📅 تاريخي',
     needsDates: true, needsEntity: false,
   },
-  {
-    id: 'historic_events',
-    icon: '⚡',
-    title: 'أحداث تاريخية',
-    desc: 'طوارئ وأحداث غير اعتيادية',
-    timing: '📅 تاريخي',
-    needsDates: true, needsEntity: false,
-  },
+  // [FIX-HE-UI] historic_events removed from UI until backend supports required params
+  // {
+  //   id: 'historic_events',
+  //   icon: '⚡',
+  //   title: 'أحداث تاريخية',
+  //   desc: 'طوارئ وأحداث غير اعتيادية',
+  //   timing: '📅 تاريخي',
+  //   needsDates: true, needsEntity: false,
+  // },
   {
     id: 'static_airport',
     icon: '🏢',
@@ -231,11 +242,22 @@ export function OperationsBoard() {
   const submitForPreflight = async () => {
     setSubmitting(true);
     setError('');
+
+    // [FIX-SA-UI] Validate static_airline ICAO code before submission
+    if (capability === 'static_airline' && entityId) {
+      const icao = entityId.trim().toUpperCase();
+      if (icao.length !== 3 || !/^[A-Z]{3}$/.test(icao)) {
+        setError('رمز ICAO يجب أن يكون 3 أحرف (مثال: UAE، SVA)');
+        setSubmitting(false);
+        return;
+      }
+    }
+
     try {
       const scope: Record<string, unknown> = { region_key: regionKey };
       if (capMeta?.needsDates && dateFrom) scope.date_from = dateFrom;
       if (capMeta?.needsDates && dateTo)   scope.date_to   = dateTo;
-      if (capMeta?.needsEntity && entityId) scope.entity_id = entityId;
+      if (capMeta?.needsEntity && entityId) scope.entity_id = entityId.trim().toUpperCase();
 
       const res = await apiClient.post('/api/v1/operations', {
         capability_type: capability,
