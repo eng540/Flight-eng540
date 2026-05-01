@@ -10,6 +10,28 @@ Evidence §5 Execution Flow:
        chunk = OperationChunk(...)
        db.add(chunk)
    SET operation.chunks_total = len(chunks)"
+
+FIXES APPLIED (2026-05-01):
+  [FIX-FS] flight_summaries now includes an additional search parameter
+           required by FR24 /api/flight-summary/full endpoint.
+           If an airline_icao exists in scope, it is used.
+           Otherwise the scope_region_key is used to look up airport codes
+           from DimGeography and the `airports` parameter is set.
+           Evidence: FR24 error "None of the required fields were provided.
+           Please include at least one of the following: flight_ids OR
+           flight_datetime_from + flight_datetime_to + at least one
+           additional search parameter".
+
+  [FIX-HE] historic_events is temporarily disabled because it requires
+           flight_ids and event_types which are not yet available in
+           the current planning flow. A clear ValueError is raised so
+           that the chunk is marked as failed with an informative message.
+           Evidence: FR24 error "The flight ids field is required.,
+           The event types field is required."
+
+  [FIX-SA] static_airline now validates that the ICAO code is a 3‑letter
+           uppercase string before the chunk is created, preventing
+           infinite retry loops on invalid input.
 """
 from __future__ import annotations
 
@@ -48,7 +70,7 @@ class OperationsPlanner:
 
         for plan in chunk_plan:
             # Build FR24 params dict for this specific chunk
-            fr24_params = OperationsPlanner._build_fr24_params(operation, plan)
+            fr24_params = OperationsPlanner._build_fr24_params(db, operation, plan)
 
             chunk = OperationChunk(
                 operation_id=operation.id,
@@ -96,7 +118,6 @@ class OperationsPlanner:
                 max_attempts=3,
 
                 # Partial result key: "op:{op_id}:chunk:{index}"
-                # Set here so DB queries can reference it immediately
                 partial_result_key=(
                     f"op:{operation.id}:chunk:{plan.chunk_index}"
                 ),
@@ -113,8 +134,12 @@ class OperationsPlanner:
 
         return chunks
 
+    # ------------------------------------------------------------------
+    # FIXED: _build_fr24_params now receives db so that it can look up
+    # airport codes when needed for flight_summaries.
+    # ------------------------------------------------------------------
     @staticmethod
-    def _build_fr24_params(operation: Operation, plan) -> dict:
+    def _build_fr24_params(db: Session, operation: Operation, plan) -> dict:
         """
         Builds the exact parameters dict to pass to FR24 API.
         Based on capability type and chunk-specific scope.
@@ -152,11 +177,28 @@ class OperationsPlanner:
                 params["flight_datetime_from"] = f"{plan.date_from}T00:00:00Z"
             if plan.date_to:
                 params["flight_datetime_to"]   = f"{plan.date_to}T23:59:59Z"
+
+            # [FIX-FS] FR24 requires an additional search parameter.
+            # Priority: 1) airline_icao from scope  2) airports from region.
             if operation.scope_entity_id and operation.scope_entity_type == "airline":
-                params["airline_icao"] = operation.scope_entity_id
-            if operation.scope_filters:
-                if "operator_icao" in operation.scope_filters:
-                    params["airline_icao"] = operation.scope_filters["operator_icao"]
+                params["airline_icao"] = operation.scope_entity_id.strip().upper()
+            elif operation.scope_filters and "operator_icao" in operation.scope_filters:
+                params["airline_icao"] = operation.scope_filters["operator_icao"].strip().upper()
+            elif operation.scope_region_key:
+                # Look up airport codes for the region from DimGeography
+                airport_codes = _get_region_airport_codes(db, operation.scope_region_key)
+                if airport_codes:
+                    params["airports"] = ",".join(airport_codes)
+                else:
+                    raise ValueError(
+                        "flight_summaries requires an additional filter. "
+                        "Please specify an airline or ensure the region has airports."
+                    )
+            else:
+                raise ValueError(
+                    "flight_summaries requires an additional filter. "
+                    "Please specify an airline or a region."
+                )
             params["limit"] = 100
 
         elif cap == "flight_tracks":
@@ -164,26 +206,26 @@ class OperationsPlanner:
                 params["flight_id"] = plan.entity_id
 
         elif cap == "historic_events":
-            bounds = _build_bounds(operation, plan.region_key)
-            if bounds:
-                params["bounds"] = (
-                    f"{bounds['lamax']},{bounds['lamin']},"
-                    f"{bounds['lomin']},{bounds['lomax']}"
-                )
-            if plan.date_from:
-                d = date.fromisoformat(plan.date_from)
-                params["timestamp"] = int(datetime(
-                    d.year, d.month, d.day, 12, 0, 0,
-                    tzinfo=timezone.utc,
-                ).timestamp())
+            # [FIX-HE] This endpoint requires flight_ids + event_types.
+            # We do not yet have a way to obtain flight_ids in the planning
+            # flow, so we explicitly disable this capability.
+            raise ValueError(
+                "historic_events requires flight_ids and event_types, "
+                "which are not yet supported. Use flight_summaries instead."
+            )
 
         elif cap == "static_airport":
             # endpoint already contains the code: /api/static/airports/{code}/full
-            # no extra params needed
             pass
 
         elif cap == "static_airline":
-            pass
+            # [FIX-SA] Validate that the ICAO code looks plausible.
+            eid = (plan.entity_id or "").strip().upper()
+            if not eid or len(eid) != 3 or not eid.isalpha():
+                raise ValueError(
+                    f"'{plan.entity_id}' is not a valid airline ICAO code. "
+                    f"Provide a 3-letter code (e.g., UAE, SVA)."
+                )
 
         return params
 
@@ -209,3 +251,29 @@ def _build_bounds(operation: Operation, region_key=None) -> dict:
                 "lamax": region.lamax, "lomax": region.lomax,
             }
     return {}
+
+
+def _get_region_airport_codes(db: Session, region_key: str) -> List[str]:
+    """
+    Returns a list of ICAO airport codes that reside inside the
+    geographic bounding box of the given region.
+    """
+    region = settings.get_region(region_key)
+    if not region:
+        return []
+
+    from app.models import DimGeography
+
+    airports = (
+        db.query(DimGeography.icao_code)
+        .filter(
+            DimGeography.icao_code.isnot(None),
+            DimGeography.latitude >= region.lamin,
+            DimGeography.latitude <= region.lamax,
+            DimGeography.longitude >= region.lomin,
+            DimGeography.longitude <= region.lomax,
+        )
+        .all()
+    )
+    # Flatten the list of tuples
+    return [code for (code,) in airports if code]
