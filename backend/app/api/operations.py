@@ -543,8 +543,8 @@ def _chunk_to_item(c: OperationChunk) -> ChunkProgressItem:
 def _dispatch_operation_task(operation_id: int) -> None:
     """Dispatches the Celery execution task asynchronously."""
     try:
-        from worker.tasks.operations_task import execute_operation_task
-        execute_operation_task.delay(operation_id)
+        from worker.celery_app import celery_app
+        celery_app.send_task("worker.tasks.operations_task.execute_operation_task", args=[operation_id])
     except Exception as exc:
         import logging
         logging.getLogger(__name__).error(
