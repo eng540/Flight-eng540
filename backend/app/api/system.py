@@ -59,3 +59,12 @@ def get_system_status(db: Session = Depends(get_db)):
         "active_regions":  settings.get_active_region_keys(),
         "retention_days":  settings.DATA_RETENTION_DAYS,
     }
+
+
+@router.get("/seed-static-data", summary="تغذية قاعدة البيانات بالمطارات والشركات")
+def seed_data_endpoint(db: Session = Depends(get_db)):
+    """
+    رابط خفي لتشغيل سكربت التغذية. يفتح من المتصفح مباشرة.
+    """
+    from app.services.static_seeder import seed_all_static_data
+    return seed_all_static_data(db)
