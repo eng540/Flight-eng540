@@ -147,10 +147,8 @@ class OperationsCRUD:
         reason: Optional[str] = None,
     ) -> Optional[Operation]:
         """
-        Sets cancel_requested = True. Worker will stop after current chunk.
-        Evidence: §7 "SET cancel_requested = TRUE, worker checks between chunks"
-        Note: Does NOT immediately set status = 'cancelled'.
-        The worker does that after completing/aborting the running chunk.
+        Instant Kill: Sets operation status to cancelled immediately 
+        and cancels all pending or retrying chunks.
         """
         op = db.query(Operation).filter(Operation.id == operation_id).first()
         if not op:
@@ -159,8 +157,25 @@ class OperationsCRUD:
             raise ValueError(
                 f"العملية في حالة '{op.status}' — لا يمكن إلغاؤها"
             )
+        
+        now = datetime.now(timezone.utc)
+        
+        # 1. Update operation status immediately
         op.cancel_requested = True
         op.cancel_reason    = reason
+        op.status           = "cancelled"
+        op.cancelled_at     = now
+        
+        # 2. Stop all pending, running, or failed (retrying) chunks
+        active_chunks = db.query(OperationChunk).filter(
+            OperationChunk.operation_id == operation_id,
+            OperationChunk.status.in_(["pending", "running", "failed"])
+        ).all()
+        
+        for chunk in active_chunks:
+            chunk.status = "cancelled"
+            op.chunks_cancelled += 1
+            
         db.commit()
         db.refresh(op)
         return op
