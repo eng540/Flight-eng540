@@ -378,7 +378,7 @@ class FlightIngestionService:
 
                 data = self._safe_request(
                     "/api/flight-summary/full",
-                    {"flight_id": ids_param, "limit": len(chunk)},
+                    {"flight_ids": ids_param, "limit": len(chunk)},
                 )
                 if not data:
                     errors += len(chunk)
