@@ -397,45 +397,73 @@ def export_results(
     db: Session = Depends(get_db),
 ):
     """
-    Exports all available results (from completed chunks) as CSV.
-    Available immediately when status=partial — no need to wait for completion.
-    Evidence: §6 Partial Results Strategy + §7 "النتائج المُجمَّعة محفوظة"
+    Exports all available results as CSV based on the capability type.
     """
     op = OperationsCRUD.get_by_id(db, operation_id)
     if not op:
         raise HTTPException(status_code=404, detail=f"العملية {operation_id} غير موجودة")
 
-    sessions = (
-        db.query(FactFlightSession)
-        .filter(FactFlightSession.operation_id == operation_id)
-        .order_by(FactFlightSession.first_seen_ts.asc())
-        .all()
-    )
-
     output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=[
-        "session_id", "fr24_id", "flight_number", "callsign", "status",
-        "aircraft_icao24", "operator",
-        "dep_airport", "arr_airport",
-        "first_seen", "last_seen", "max_altitude_m", "total_distance_km",
-    ])
-    writer.writeheader()
-    for s in sessions:
-        writer.writerow({
-            "session_id":    s.session_id,
-            "fr24_id":       s.fr24_id or "",
-            "flight_number": s.flight_number or "",
-            "callsign":      s.callsign or "",
-            "status":        s.flight_status or "",
-            "aircraft_icao24": s.aircraft.icao24 if s.aircraft else "",
-            "operator":      s.operator.icao_code if s.operator else "",
-            "dep_airport":   s.dep_airport.icao_code if s.dep_airport else "",
-            "arr_airport":   s.arr_airport.icao_code if s.arr_airport else "",
-            "first_seen":    s.first_seen_ts.isoformat() if s.first_seen_ts else "",
-            "last_seen":     s.last_seen_ts.isoformat()  if s.last_seen_ts  else "",
-            "max_altitude_m":    s.max_altitude_m    or "",
-            "total_distance_km": s.total_distance_km or "",
-        })
+
+    # 1. تصدير بيانات المطارات الثابتة
+    if op.capability_type == "static_airport":
+        from app.models import DimGeography
+        airport = db.query(DimGeography).filter(DimGeography.icao_code == op.scope_entity_id).first()
+        
+        writer = csv.DictWriter(output, fieldnames=[
+            "icao_code", "iata_code", "name", "city", "country_code", "latitude", "longitude", "elevation_m"
+        ])
+        writer.writeheader()
+        if airport:
+            writer.writerow({
+                "icao_code": airport.icao_code, "iata_code": airport.iata_code, "name": airport.name,
+                "city": airport.city, "country_code": airport.country_code, 
+                "latitude": airport.latitude, "longitude": airport.longitude, "elevation_m": airport.elevation_m
+            })
+
+    # 2. تصدير بيانات الناقلين (شركات الطيران) الثابتة
+    elif op.capability_type == "static_airline":
+        from app.models import DimOperator
+        operator = db.query(DimOperator).filter(DimOperator.icao_code == op.scope_entity_id).first()
+        
+        writer = csv.DictWriter(output, fieldnames=["icao_code", "iata_code", "name", "country_code"])
+        writer.writeheader()
+        if operator:
+            writer.writerow({
+                "icao_code": operator.icao_code, "iata_code": operator.iata_code,
+                "name": operator.name, "country_code": operator.country_code
+            })
+
+    # 3. تصدير بيانات الرحلات والمواقع (الوضع الافتراضي لباقي العمليات)
+    else:
+        sessions = (
+            db.query(FactFlightSession)
+            .filter(FactFlightSession.operation_id == operation_id)
+            .order_by(FactFlightSession.first_seen_ts.asc())
+            .all()
+        )
+        writer = csv.DictWriter(output, fieldnames=[
+            "session_id", "fr24_id", "flight_number", "callsign", "status",
+            "aircraft_icao24", "operator", "dep_airport", "arr_airport",
+            "first_seen", "last_seen", "max_altitude_m", "total_distance_km",
+        ])
+        writer.writeheader()
+        for s in sessions:
+            writer.writerow({
+                "session_id":    s.session_id,
+                "fr24_id":       s.fr24_id or "",
+                "flight_number": s.flight_number or "",
+                "callsign":      s.callsign or "",
+                "status":        s.flight_status or "",
+                "aircraft_icao24": s.aircraft.icao24 if s.aircraft else "",
+                "operator":      s.operator.icao_code if s.operator else "",
+                "dep_airport":   s.dep_airport.icao_code if s.dep_airport else "",
+                "arr_airport":   s.arr_airport.icao_code if s.arr_airport else "",
+                "first_seen":    s.first_seen_ts.isoformat() if s.first_seen_ts else "",
+                "last_seen":     s.last_seen_ts.isoformat()  if s.last_seen_ts  else "",
+                "max_altitude_m":    s.max_altitude_m    or "",
+                "total_distance_km": s.total_distance_km or "",
+            })
 
     output.seek(0)
     filename = f"operation_{op.operation_ref}_results.csv"
