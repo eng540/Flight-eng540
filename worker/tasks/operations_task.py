@@ -323,23 +323,22 @@ def _store_with_operation_tag(db, payloads, operation_id: int, chunk_id: int):
     """
     from app.crud import EnterpriseDataRouter
     from app.models import FactFlightSession
-    from sqlalchemy import and_
-    from datetime import datetime, timezone
 
-    # Store normally via existing router
+    # 1. Store normally via existing router
     EnterpriseDataRouter.process_telemetry_batch(db, payloads)
 
-    # Tag recently created sessions with operation_id + chunk_id
-    # (sessions where operation_id is still NULL = created in this batch)
-    db.query(FactFlightSession).filter(
-        FactFlightSession.operation_id.is_(None),
-        FactFlightSession.last_seen_ts >= datetime.now(timezone.utc).replace(
-            second=0, microsecond=0
-        ),
-    ).update(
-        {"operation_id": operation_id, "chunk_id": chunk_id},
-        synchronize_session=False,
-    )
+    # 2. Extract the FR24 IDs from the payloads we just inserted/updated
+    fr24_ids = list({p.fr24_id for p in payloads if p.fr24_id})
+    
+    # 3. Tag these specific flights so they appear in CSV Exports!
+    if fr24_ids:
+        db.query(FactFlightSession).filter(
+            FactFlightSession.fr24_id.in_(fr24_ids),
+            FactFlightSession.operation_id.is_(None)
+        ).update(
+            {"operation_id": operation_id, "chunk_id": chunk_id},
+            synchronize_session=False,
+        )
 
 
 def _store_tracks(db, tracks: list, fr24_id: str, operation_id: int, chunk_id: int):
