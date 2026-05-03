@@ -8,6 +8,10 @@ Evidence:
   §5 Execution Flow — operation creation, approval, chunk lifecycle
   §6 Partial Results — query by operation_id
   §7 Failure Handling — chunk retry, cancel, credit exhaustion
+
+INCLUDES FIXES:
+  - Instant Kill on Cancel (Zombies fix)
+  - Hard stop on HTTP 400/401/403 errors (Infinite Retry loop fix)
 """
 from __future__ import annotations
 
@@ -431,16 +435,19 @@ class ChunksCRUD:
         chunk.last_error  = error
         chunk.http_status = http_status
 
-        if chunk.can_retry:
+        # 🚨 FIX: Do not retry if the error is a client/fatal error
+        is_fatal_http = http_status in (400, 401, 403, 404, 422)
+
+        if chunk.can_retry and not is_fatal_http:
             # Exponential backoff: attempt 1→60s, 2→120s, 3→240s
             backoff_s = (2 ** chunk.attempt_count) * 30
             chunk.next_retry_at = datetime.now(timezone.utc) + timedelta(seconds=backoff_s)
         else:
-            # Final failure — update parent
+            # Final failure or fatal error
             op = db.query(Operation).filter(Operation.id == chunk.operation_id).first()
             if op:
                 op.chunks_failed += 1
-                # Check if all non-skipped chunks are terminal
+                
                 pending_count = (
                     db.query(func.count(OperationChunk.id))
                     .filter(
@@ -449,9 +456,20 @@ class ChunksCRUD:
                     )
                     .scalar() or 0
                 )
-                if pending_count == 0 and op.status not in ("completed", "cancelled"):
-                    op.status         = "failed"
-                    op.failure_reason = f"الـ chunk {chunk.chunk_index} فشل نهائياً: {error}"
+                
+                if is_fatal_http or pending_count == 0:
+                    if op.status not in ("completed", "cancelled"):
+                        op.status         = "failed"
+                        op.failure_reason = f"فشل نهائي في الـ chunk {chunk.chunk_index}: {error}"
+                        
+                        other_chunks = db.query(OperationChunk).filter(
+                            OperationChunk.operation_id == chunk.operation_id,
+                            OperationChunk.status == "pending"
+                        ).all()
+                        for c in other_chunks:
+                            c.status = "cancelled"
+                            op.chunks_cancelled += 1
+
         db.flush()
 
     @staticmethod
