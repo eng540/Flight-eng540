@@ -10,6 +10,10 @@ Evidence §5 Execution Flow:
        chunk = OperationChunk(...)
        db.add(chunk)
    SET operation.chunks_total = len(chunks)"
+   
+INCLUDES FIXES FROM ARCHITECT AUDIT (v6.2):
+  - flight_summaries uses 'operating_as' strictly instead of 'airline_icao' (P0-V1).
+  - historic_events entirely eradicated from planning to prevent HTTP 400 (P0-V4).
 """
 from __future__ import annotations
 
@@ -44,7 +48,7 @@ class OperationsPlanner:
         engine     = PreflightEngine(db)
         chunk_plan = engine._build_chunk_plan(operation)
 
-        chunks: List[OperationChunk] = []
+        chunks: List[OperationChunk] =[]
 
         for plan in chunk_plan:
             # Build FR24 params dict for this specific chunk
@@ -152,7 +156,9 @@ class OperationsPlanner:
                 params["flight_datetime_from"] = f"{plan.date_from}T00:00:00Z"
             if plan.date_to:
                 params["flight_datetime_to"]   = f"{plan.date_to}T23:59:59Z"
-            if operation.scope_entity_id and operation.scope_entity_type == "airline":
+            
+            # 🚨 FIX P0-V1 & HI-V4: Must use operating_as
+            if operation.scope_entity_id:
                 params["operating_as"] = operation.scope_entity_id
             if operation.scope_filters:
                 if "operator_icao" in operation.scope_filters:
@@ -163,10 +169,7 @@ class OperationsPlanner:
             if plan.entity_id:
                 params["flight_id"] = plan.entity_id
 
-        elif cap == "historic_events":
-            if plan.entity_id:
-                params["flight_ids"] = plan.entity_id
-                params["event_types"] = "all"
+        # 🚨 FIX P0-V4: historic_events completely removed from planner logic to prevent 400 errors.
 
         elif cap == "static_airport":
             # endpoint already contains the code: /api/static/airports/{code}/full
