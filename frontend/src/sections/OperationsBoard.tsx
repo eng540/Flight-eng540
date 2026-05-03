@@ -1,12 +1,13 @@
 /**
- * OperationsBoard.tsx — v6.2 (STRICT OPENAPI COMPLIANCE)
+ * OperationsBoard.tsx — v6.3 (STRICT OPENAPI COMPLIANCE & UI FIXES)
  *
  * "قمرة القيادة" — translates complex FR24 capabilities into
  * a simple Arabic wizard: select → configure → review → launch → track.
  *
- * INCLUDES FIXES FROM ARCHITECT AUDIT:
- *   - flight_summaries strictly requires an entity (airline code) (HI-V4).
- *   - historic_events completely removed to prevent 400 errors (P0-V4).
+ * INCLUDES FIXES:
+ *   - flight_summaries strictly requires an entity (airline code) to prevent HTTP 400.
+ *   - historic_events completely removed to prevent 400 errors.
+ *   - UI explicitly asks for required inputs based on the capability.
  *
  * Two panels:
  *   LEFT:  New Operation Wizard (4 steps)
@@ -87,9 +88,7 @@ interface ChunkItem {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CAPABILITY DEFINITIONS (v6.2 — STRICT OPENAPI COMPLIANCE)
-// 🚨 HI-V4 FIX: flight_summaries now strictly requires an entity (airline code)
-// 🚨 P0-V4 FIX: historic_events completely removed to prevent 400 errors.
+// CAPABILITY DEFINITIONS
 // ─────────────────────────────────────────────────────────────────────────────
 const CAPABILITIES =[
   {
@@ -106,7 +105,7 @@ const CAPABILITIES =[
     title: 'ملخصات الرحلات',
     desc: 'كل الرحلات لشركة معينة في فترة محددة (بحد أقصى 14 يوماً)',
     timing: '📅 تاريخي',
-    needsDates: true, needsEntity: true, entityLabel: 'كود الناقل ICAO (إجباري)',
+    needsDates: true, needsEntity: true, entityLabel: 'كود الناقل ICAO (إجباري 3 أحرف)',
   },
   {
     id: 'flight_tracks',
@@ -157,14 +156,14 @@ export function OperationsBoard() {
   const [step,       setStep]       = useState<1|2|3|4>(1);
   const [capability, setCapability] = useState<string>('');
   const [regionKey,  setRegionKey]  = useState('middle_east');
-  const[dateFrom,   setDateFrom]   = useState('');
+  const [dateFrom,   setDateFrom]   = useState('');
   const [dateTo,     setDateTo]     = useState('');
-  const [entityId,   setEntityId]   = useState('');
+  const[entityId,   setEntityId]   = useState('');
 
-  const[preflight,  setPreflight]  = useState<PreflightSummary | null>(null);
-  const[submitting, setSubmitting] = useState(false);
+  const [preflight,  setPreflight]  = useState<PreflightSummary | null>(null);
+  const [submitting, setSubmitting] = useState(false);
   const [launching,  setLaunching]  = useState(false);
-  const [error,      setError]      = useState('');
+  const[error,      setError]      = useState('');
 
   const [operations, setOperations] = useState<OperationProgress[]>([]);
   const [expandedChunks, setExpandedChunks] = useState<Record<number, ChunkItem[]>>({});
@@ -229,7 +228,7 @@ export function OperationsBoard() {
       const scope: Record<string, unknown> = { region_key: regionKey };
       if (capMeta?.needsDates && dateFrom) scope.date_from = dateFrom;
       if (capMeta?.needsDates && dateTo)   scope.date_to   = dateTo;
-      if (capMeta?.needsEntity && entityId) scope.entity_id = entityId;
+      if (capMeta?.needsEntity && entityId) scope.entity_id = entityId.trim();
 
       const res = await apiClient.post('/api/v1/operations', {
         capability_type: capability,
@@ -270,7 +269,8 @@ export function OperationsBoard() {
   // ── Cancel operation ────────────────────────────────────────────────────
   const cancelOperation = async (opId: number) => {
     try {
-      await apiClient.post(`/api/v1/operations/${opId}/cancel`, { reason: 'طلب المستخدم' });
+      await apiClient.post(`/api/v1/operations/${opId}/cancel`, { reason: 'طلب المستخدم (إلغاء فوري)' });
+      // Reload immediately to reflect the instant kill status
       loadOperations();
     } catch { /* silent */ }
   };
@@ -414,7 +414,7 @@ export function OperationsBoard() {
                   )}
 
                   <Button onClick={submitForPreflight}
-                    disabled={submitting || (capMeta.needsEntity && !entityId)}
+                    disabled={submitting || (capMeta.needsEntity && !entityId.trim())}
                     className="w-full">
                     {submitting ? '⏳ جاري الحساب…' : '📋 احسب التكلفة'}
                   </Button>
@@ -431,8 +431,9 @@ export function OperationsBoard() {
                     </div>
 
                     <div className="grid grid-cols-2 gap-2 pt-1">
-                      {[
-                        ['🔢 مكالمات API', `${preflight.estimated_api_calls}`],['💳 التكلفة', `~${preflight.estimated_credits.toLocaleString('ar')} نقطة`],['⏱️ الوقت', preflight.estimated_duration_label],['📦 النتائج', `~${preflight.estimated_results.toLocaleString('ar')}`],
+                      {[['🔢 مكالمات API', `${preflight.estimated_api_calls}`],['💳 التكلفة', `~${preflight.estimated_credits.toLocaleString('ar')} نقطة`],
+                        ['⏱️ الوقت', preflight.estimated_duration_label],
+                        ['📦 النتائج', `~${preflight.estimated_results.toLocaleString('ar')}`],
                       ].map(([label, value]) => (
                         <div key={label} className="bg-background rounded p-2">
                           <div className="text-xs text-muted-foreground">{label}</div>
@@ -578,6 +579,11 @@ function OperationCard({
               <Badge variant="outline" className="text-xs">{sc.label}</Badge>
               <span className="text-xs text-muted-foreground">{op.capability_type}</span>
             </div>
+            {op.cancel_requested && !op.is_terminal && (
+              <div className="text-xs text-destructive mt-1 font-medium animate-pulse">
+                ⏳ جاري إيقاف العملية وإلغاء الارتباطات...
+              </div>
+            )}
           </div>
         </div>
 
@@ -605,7 +611,7 @@ function OperationCard({
         </div>
 
         {/* Current chunk indicator */}
-        {op.current_chunk && !op.is_terminal && (
+        {op.current_chunk && !op.is_terminal && !op.cancel_requested && (
           <div className="text-xs bg-yellow-500/10 rounded p-2">
             ⏳ جاري الآن: {String((op.current_chunk as any).date_from || (op.current_chunk as any).entity_id || '—')}
           </div>
@@ -651,10 +657,10 @@ function OperationCard({
             </Button>
           )}
 
-          {op.can_be_cancelled && (
+          {op.can_be_cancelled && !op.cancel_requested && (
             <Button variant="outline" size="sm" className="text-xs h-7 text-destructive"
               onClick={onCancel}>
-              🛑 إلغاء
+              🛑 إلغاء فوري
             </Button>
           )}
         </div>
