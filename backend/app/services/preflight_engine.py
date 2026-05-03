@@ -8,7 +8,10 @@ Computes BEFORE user approval:
   - full chunk plan (list of ChunkPlan for UI display)
   - warnings (large range, low balance, etc.)
 
-All formulas are taken verbatim from system design document §4.
+INCLUDES FIXES FROM ARCHITECT AUDIT (v6.2):
+  - Enforces 14-day maximum range for flight_summaries (HI-V1).
+  - Enforces mandatory entity filter for flight_summaries (HI-V4).
+  - historic_events entirely eradicated from engine (P0-V4).
 """
 from __future__ import annotations
 
@@ -39,13 +42,12 @@ LARGE_DATE_RANGE_DAYS  = 30
 LOW_BALANCE_THRESHOLD  = 500   # نقاط — تحذير إذا أقل
 
 # FR24 endpoint map per capability
-# Evidence: §5 Execution Flow — fr24_endpoint set at planning time
+# 🚨 FIX P0-V4: historic_events removed
 CAPABILITY_ENDPOINT_MAP = {
     "live_positions":    "/api/live/flight-positions/full",
     "flight_summaries":  "/api/flight-summary/full",
     "flight_tracks":     "/api/flight-tracks",
     "historic_positions":"/api/historic/flight-positions/full",
-    "historic_events":   "/api/historic/flight-events/full",
     "static_airport":    "/api/static/airports/{code}/full",
     "static_airline":    "/api/static/airlines/{icao}/light",
 }
@@ -56,7 +58,6 @@ CAPABILITY_LABELS_AR = {
     "flight_summaries":  "ملخصات الرحلات",
     "flight_tracks":     "مسار رحلة بعينها",
     "historic_positions":"مواقع تاريخية",
-    "historic_events":   "أحداث تاريخية",
     "static_airport":    "بيانات المطار",
     "static_airline":    "بيانات الناقل",
 }
@@ -67,7 +68,6 @@ _FALLBACK_RATES = {
     "flight_summaries":  {"per_call": 5,   "per_record": 0.1, "duration": 2.5, "results": 1200},
     "flight_tracks":     {"per_call": 5,   "per_record": 0,   "duration": 1.5, "results": 120},
     "historic_positions":{"per_call": 20,  "per_record": 0,   "duration": 3.0, "results": 800},
-    "historic_events":   {"per_call": 15,  "per_record": 0,   "duration": 2.5, "results": 300},
     "static_airport":    {"per_call": 0,   "per_record": 0,   "duration": 1.0, "results": 1},
     "static_airline":    {"per_call": 0,   "per_record": 0,   "duration": 1.0, "results": 1},
 }
@@ -169,12 +169,16 @@ class PreflightEngine:
 
     def _build_chunk_plan(self, op: Operation) -> List[ChunkPlan]:
         cap = op.capability_type
+        
+        if cap not in CAPABILITY_ENDPOINT_MAP:
+            return []
+            
         ep  = CAPABILITY_ENDPOINT_MAP[cap]
 
         if cap == "live_positions":
             return self._plan_live_positions(op, ep)
 
-        if cap in ("historic_positions", "flight_summaries", "historic_events"):
+        if cap in ("historic_positions", "flight_summaries"):
             return self._plan_temporal(op, ep)
 
         if cap == "flight_tracks":
@@ -183,18 +187,17 @@ class PreflightEngine:
         if cap in ("static_airport", "static_airline"):
             return self._plan_static(op, ep)
 
-        return []
+        return[]
 
     def _plan_live_positions(self, op: Operation, ep: str) -> List[ChunkPlan]:
         """
         §4: "مكالمة واحدة لكل منطقة جغرافية"
         """
-        region_keys = (
-            [op.scope_region_key]
+        region_keys = ([op.scope_region_key]
             if op.scope_region_key
             else settings.get_active_region_keys()
         )
-        plans = []
+        plans =[]
         for i, rk in enumerate(region_keys):
             region = settings.get_region(rk)
             bounds = (
@@ -213,7 +216,7 @@ class PreflightEngine:
 
     def _plan_temporal(self, op: Operation, ep: str) -> List[ChunkPlan]:
         """
-        §4: "مكالمة واحدة لكل يوم" (historic_positions, flight_summaries, historic_events)
+        §4: "مكالمة واحدة لكل يوم" (historic_positions, flight_summaries)
         Each day in [scope_date_from, scope_date_to] = one chunk.
         """
         if not op.scope_date_from or not op.scope_date_to:
@@ -224,7 +227,7 @@ class PreflightEngine:
             d_from = op.scope_date_from
             d_to   = op.scope_date_to
 
-        plans   = []
+        plans   =[]
         current = d_from
         idx     = 0
         while current <= d_to:
@@ -250,14 +253,14 @@ class PreflightEngine:
         §4: "مكالمة واحدة لكل fr24_id" (flight_tracks)
         entity_ids from scope_filters or single scope_entity_id.
         """
-        entity_ids: List[str] = []
+        entity_ids: List[str] =[]
 
         if op.scope_filters and "entity_ids" in op.scope_filters:
             entity_ids = op.scope_filters["entity_ids"]
         elif op.scope_entity_id:
             entity_ids = [op.scope_entity_id]
 
-        return [
+        return[
             ChunkPlan(
                 chunk_index=i,
                 label=f"رحلة: {eid}",
@@ -273,7 +276,7 @@ class PreflightEngine:
         §4: "مكالمة واحدة لكل كيان" — static_airport, static_airline.
         Cost = 0 credits (free endpoints).
         """
-        entity_ids: List[str] = []
+        entity_ids: List[str] =[]
         if op.scope_filters and "entity_ids" in op.scope_filters:
             entity_ids = op.scope_filters["entity_ids"]
         elif op.scope_entity_id:
@@ -283,7 +286,7 @@ class PreflightEngine:
             "{code}"     if op.capability_type == "static_airport"
             else "{icao}"
         )
-        return [
+        return[
             ChunkPlan(
                 chunk_index=i,
                 label=f"{'مطار' if 'airport' in op.capability_type else 'ناقل'}: {eid}",
@@ -348,12 +351,20 @@ class PreflightEngine:
         current_balance: Optional[int],
         chunk_plan: List[ChunkPlan],
     ) -> List[PreflightWarning]:
-        warnings: List[PreflightWarning] = []
+        warnings: List[PreflightWarning] =[]
 
-        # Large date range
+        # Large date range checks
         if op.scope_date_from and op.scope_date_to:
             days = (op.scope_date_to - op.scope_date_from).days + 1
-            if days > LARGE_DATE_RANGE_DAYS:
+            
+            # 🚨 FIX HI-V1: Hard block if flight_summaries exceeds 14 days
+            if op.capability_type == "flight_summaries" and days > 14:
+                warnings.append(PreflightWarning(
+                    level="critical",
+                    code="EXCEEDS_14_DAYS",
+                    message="ملخصات الرحلات لا تدعم نطاقاً زمنياً يتجاوز 14 يوماً حسب قيود FR24."
+                ))
+            elif days > LARGE_DATE_RANGE_DAYS:
                 warnings.append(PreflightWarning(
                     level="warning",
                     code="LARGE_DATE_RANGE",
@@ -362,6 +373,14 @@ class PreflightEngine:
                         f"فكر في تقسيم الطلب إلى فترات أصغر."
                     ),
                 ))
+
+        # 🚨 FIX HI-V4: Hard block if flight_summaries missing entity
+        if op.capability_type == "flight_summaries" and not op.scope_entity_id:
+            warnings.append(PreflightWarning(
+                level="critical",
+                code="MISSING_ENTITY",
+                message="ملخصات الرحلات تتطلب تحديد كود شركة الطيران بشكل إجباري لتفادي رفض الطلب."
+            ))
 
         # Insufficient credits
         if current_balance is not None and current_balance < estimated_credits:
@@ -395,7 +414,7 @@ class PreflightEngine:
                 ))
 
         # No scope
-        if op.capability_type in ("historic_positions", "flight_summaries", "historic_events"):
+        if op.capability_type in ("historic_positions", "flight_summaries"):
             if not op.scope_date_from or not op.scope_date_to:
                 warnings.append(PreflightWarning(
                     level="warning",
@@ -404,9 +423,7 @@ class PreflightEngine:
                 ))
 
         # Historical data notice
-        if op.capability_type in (
-            "historic_positions", "flight_summaries", "historic_events"
-        ):
+        if op.capability_type in ("historic_positions", "flight_summaries"):
             warnings.append(PreflightWarning(
                 level="info",
                 code="HISTORICAL_NOTE",
@@ -471,7 +488,7 @@ def _date_label(d: date) -> str:
     Converts a date to Arabic label.
     Example: date(2026, 3, 15) → "15 مارس 2026"
     """
-    MONTHS_AR = [
+    MONTHS_AR =[
         "", "يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو",
         "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر",
     ]
