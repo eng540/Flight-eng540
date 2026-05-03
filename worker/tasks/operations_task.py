@@ -5,6 +5,11 @@ execute_operation_task: processes all chunks for one Operation.
 retry_chunks_task: scheduler tick for failed-but-retryable chunks.
 
 Full state machine compliance per system design §3 + §7.
+
+INCLUDES FIXES:
+  - Zero-Chunk Paralysis fixed (Operations with 0 chunks mark as completed immediately).
+  - Infinite Retry fixed (Do not retry chunks on HTTP 400/401/403/404/422).
+  - CSV Export fix (Tag flight sessions using their exact fr24_id).
 """
 import logging
 import time
@@ -71,6 +76,14 @@ def execute_operation_task(self, operation_id: int):
         logger.info(
             f"[OpsTask] Operation {operation_id}: {len(chunks)} pending chunks"
         )
+
+        # 🚨 FIX (Zero-Chunk Paralysis): End the operation immediately if there are no chunks
+        if len(chunks) == 0:
+            logger.info(f"[OpsTask] Operation {operation_id} has 0 chunks. Marking as completed.")
+            op.status = "completed"
+            op.completed_at = _now()
+            db.commit()
+            return {"status": "done", "processed": 0, "note": "0 chunks"}
 
         processed = 0
         for chunk in chunks:
@@ -272,7 +285,7 @@ def _parse_and_store(db, response: dict, chunk, op) -> int:
     # Different response structures per capability type
     if cap in ("live_positions", "historic_positions"):
         items = response.get("data", [])
-        payloads = []
+        payloads =[]
         for item in items:
             payload = svc._parse_fr24_position(
                 item,
@@ -290,23 +303,22 @@ def _parse_and_store(db, response: dict, chunk, op) -> int:
 
     elif cap == "flight_summaries":
         # FlightSummaryFull — enrich sessions via enrich_flight_details
-        items = response.get("data", [])
-        fr24_ids = [i.get("fr24_id") for i in items if i.get("fr24_id")]
+        items = response.get("data",[])
+        fr24_ids =[i.get("fr24_id") for i in items if i.get("fr24_id")]
         if fr24_ids:
             svc.enrich_flight_details(fr24_ids)
         return len(items)
 
     elif cap == "flight_tracks":
         # Store track points for an fr24_id
-        tracks = response.get("tracks", [])
+        tracks = response.get("tracks",[])
         if tracks and chunk.entity_id:
             _store_tracks(db, tracks, chunk.entity_id, op.id, chunk.id)
         return len(tracks)
 
     elif cap == "historic_events":
-        items = response.get("data", [])
+        items = response.get("data",[])
         # Events stored in FactAviationEvent — no batch storage needed here
-        # (events are auto-created by EnterpriseDataRouter when telemetry processed)
         return len(items)
 
     elif cap in ("static_airport", "static_airline"):
@@ -451,7 +463,6 @@ def _extract_credits(response: dict) -> int:
     FR24 may include usage info in response headers or body.
     Defaults to 0 if not present.
     """
-    # FR24 API may include credits in response body
     usage = response.get("_usage") or response.get("usage") or {}
     return int(usage.get("credits", 0))
 
