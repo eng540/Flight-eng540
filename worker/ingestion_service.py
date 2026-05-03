@@ -1,15 +1,34 @@
 """
-Enterprise Ingestion Service (v6.1 — FR24 Termux-Proof)
+Enterprise Ingestion Service (v6.2 — TIER 1 Fixed + Strict OpenAPI Compliance)
 Strictly compliant with FR24 OpenAPI v1 Specification.
 
-INCLUDES ALL FIXES:
-  - fr24_id, flight_number, vspeed_fpm, aircraft_type extraction.
-  - on_ground logical physics fix (alt_ft < 100 AND gspeed < 30).
-  - operating_as ONLY for airline matching.
-  - Real DB cleanup cascade (30-day retention).
-  - OpenAPI sync: 'flight_ids' (plural) for summaries.
-  - 🛡️ NEW (v6.1): Array-to-Dict Shield for erratic endpoints like /api/flight-tracks
-    (discovered via manual curl/termux audit).
+FIXES FROM v5.0:
+  [FIX-1] fr24_id: now extracted from f.get("fr24_id")
+           Evidence: FR24 OpenAPI FlightPositionsFull.fr24_id
+  [FIX-2] flight_number: extracted from f.get("flight") (commercial number)
+           Evidence: FR24 OpenAPI FlightPositionsFull.flight
+  [FIX-3] vspeed_fpm: extracted from f.get("vspeed") (ft/min native)
+           Evidence: FR24 OpenAPI FlightPositionsFull.vspeed
+  [FIX-4] aircraft_type: extracted from f.get("type")
+           Evidence: FR24 OpenAPI FlightPositionsFull.type
+  [FIX-5] on_ground: (alt_ft < 100) AND (gspeed < 30) — was: alt_ft == 0
+           Evidence: Business requirement; FR24 alt=0 only at gate, not taxi
+  [FIX-6] operator_icao = f.get("operating_as") ONLY — removed painted_as
+           Evidence: Business requirement "Use operating_as ONLY"
+  [FIX-7] Removed hashlib.md5 — fr24_id is now the stable dedup key
+           Evidence: Business requirement "Remove unused hashlib.md5"
+  [FIX-8] cleanup_old_data(): now performs real DB deletion with 30-day window
+           Evidence: Business requirement "implement cleanup_old_data (30-day retention)"
+  [NEW-1] ingest_date_range_for_region(): uses /api/historic/flight-positions/full
+           Evidence: called by tasks.py → AttributeError without it[NEW-2] enrich_flight_details(): uses /api/flight-summary/full
+           Evidence: Business requirement "implement enrich_flight_details"
+  [NEW-3] fetch_historical_track(): uses /api/flight-tracks
+           Evidence: Business requirement "implement fetch_historical_track"[FIX-9] settings.FR24_API_KEY via Settings — removed os.getenv()
+           Evidence: P0.3 fix; silent failure when key is absent
+
+NEW FIXES FOR v6.2 (OPENAPI AUDIT):[P0-V2] enrich_flight_details: parameter changed from flight_id to flight_ids (plural)
+  [P0-V3] enrich_flight_details: chunk_size strictly limited to 15 (API max limit)
+  [API-QUIRK] _safe_request: Added Array-to-Dict shield for endpoints like /api/flight-tracks returning lists.
 """
 import logging
 import sys
@@ -41,6 +60,7 @@ class FlightIngestionService:
 
     def __init__(self):
         self._db = None
+        # FIX-9: Use settings instead of os.getenv() — consistent with P0.3
         self.fr24_api_key = settings.FR24_API_KEY
         self.fr24_base_url = settings.FR24_BASE_URL
 
@@ -70,7 +90,7 @@ class FlightIngestionService:
         """
         SRE: Resilient HTTP requester — FR24 OpenAPI spec compliant.
         Handles 429 / 401 / 402 with appropriate backpressure.
-        Includes Array-to-Dict shield for endpoints like /api/flight-tracks.
+        Includes Array-to-Dict shield for endpoints returning lists instead of dicts.
         """
         if not self.fr24_api_key:
             logger.error("[FR24 Auth] FR24_API_KEY is not set in settings.")
@@ -95,12 +115,12 @@ class FlightIngestionService:
                 self.consecutive_failures = 0
                 data = response.json()
                 
-                # 🛡️ درع الحماية الذي اكتشفناه: 
-                # بعض مسارات FR24 (مثل flight-tracks) تعيد مصفوفة بدلاً من كائن.
-                # هذا الدرع يحولها لكائن لكي لا ينهار الكود عند استخدام .get()
+                # 🛡️ Array-to-Dict Shield: 
+                # If the API (like /api/flight-tracks) incorrectly returns a list at the root,
+                # wrap it to prevent AttributeError down the line.
                 if isinstance(data, list):
                     return data[0] if len(data) > 0 else {}
-                    
+                
                 return data
 
             if response.status_code == 429:
@@ -201,8 +221,14 @@ class FlightIngestionService:
         region,
         force_reingest: bool = False,
     ) -> Dict[str, int]:
-        """
-        Ingest historic flight positions for a Unix timestamp range and region.
+        """[NEW-1] Ingest historic flight positions for a Unix timestamp range and region.
+
+        Strategy: Step through[begin_ts, end_ts] in _HISTORIC_STEP_SECONDS increments.
+        Each step calls /api/historic/flight-positions/full with:
+          - timestamp: Unix epoch of the snapshot
+          - bounds: region bounding box (lamax,lamin,lomin,lomax)
+
+        Each (date_str × region_key) is tracked as an IngestionJob for idempotency.
         """
         from app.database import SessionLocal
         from app.models import IngestionJob
@@ -335,8 +361,12 @@ class FlightIngestionService:
 
     def enrich_flight_details(self, fr24_ids: List[str]) -> Dict[str, Any]:
         """
-        Fetch full flight summary for a list of fr24_ids.
+        [NEW-2] Fetch full flight summary for a list of fr24_ids.
         Uses /api/flight-summary/full → FlightSummaryFull schema.
+        Updates FactFlightSession with departure/arrival/timing data.
+
+        Evidence: FR24 OpenAPI /api/flight-summary/full accepts
+        FlightIdsFlightSummary (comma-separated fr24_ids, max 15 IDs).
         """
         if not fr24_ids:
             return {"enriched": 0, "errors": 0}
@@ -345,8 +375,8 @@ class FlightIngestionService:
         from app.models import FactFlightSession, DimGeography
         from sqlalchemy import and_
 
-        # FR24 accepts up to 100 IDs per call
-        chunk_size = 100
+        # P0-V3 FIX: FR24 accepts maximum 15 IDs per call for flight_ids
+        chunk_size = 15
         enriched = 0
         errors = 0
 
@@ -356,7 +386,7 @@ class FlightIngestionService:
                 chunk = fr24_ids[i : i + chunk_size]
                 ids_param = ",".join(chunk)
 
-                # ✅ هنا تم إصلاح flight_id لتصبح flight_ids (للجمع)
+                # P0-V2 FIX: Changed "flight_id" to "flight_ids"
                 data = self._safe_request(
                     "/api/flight-summary/full",
                     {"flight_ids": ids_param, "limit": len(chunk)},
@@ -441,15 +471,18 @@ class FlightIngestionService:
 
     def fetch_historical_track(self, fr24_id: str) -> Optional[List[Dict]]:
         """
-        Fetch full trajectory for a given fr24_id.
+        [NEW-3] Fetch full trajectory for a given fr24_id.
+        Uses /api/flight-tracks → FlightTracks schema.
+
+        Evidence: FR24 OpenAPI /api/flight-tracks accepts query param flight_id.
+        Returns list of track points or None on failure.
         """
-        # مسار مسارات الرحلة يستخدم flight_id بصيغة المفرد حسب OpenAPI
         data = self._safe_request("/api/flight-tracks", {"flight_id": fr24_id})
         if not data:
             return None
 
-        # FR24 FlightTracks: {"fr24_id": ..., "tracks": [{timestamp, lat, ...}]}
-        tracks_raw = data.get("tracks",[]) if isinstance(data, dict) else []
+        # FR24 FlightTracks: {"fr24_id": ..., "tracks":[{timestamp, lat, lon, alt, gspeed, vspeed, track, ...}]}
+        tracks_raw = data.get("tracks",[])
         if not tracks_raw:
             return []
 
@@ -482,8 +515,17 @@ class FlightIngestionService:
 
     def cleanup_old_data(self, days: int) -> int:
         """
-        Actual deletion of data older than `days`.
-        Deletes in dependency order using cascading.
+        [FIX-8] Actual deletion of data older than `days`.
+        Previously was a no-op returning 0.
+        Evidence: Business requirement "implement cleanup_old_data (30-day retention)"
+
+        Deletes in dependency order:
+          TrackTelemetry → via CASCADE from FactFlightSession
+          FactFlightSession (old, landed sessions only)
+          CurrentAircraftState (stale entries — last_updated > 5 minutes)
+          IngestionJob (old completed jobs)
+
+        Returns: total rows deleted
         """
         if days <= 0:
             logger.info("[Cleanup] days=0 — retention disabled, nothing deleted.")
@@ -570,7 +612,8 @@ class FlightIngestionService:
     ) -> Optional[RawIngestionPayload]:
         """
         Parse a single FR24 FlightPositionsFull dict into RawIngestionPayload.
-        All field names are exactly as specified in FR24 OpenAPI.
+        All field names are exactly as specified in FR24 OpenAPI FlightPositionsFull.
+        Returns None if icao24 (hex) is missing — cannot track anonymous aircraft.
         """
         # FR24 field: hex = ICAO 24-bit transponder address
         icao24 = f.get("hex")
@@ -590,7 +633,8 @@ class FlightIngestionService:
         gspeed   = f.get("gspeed") # knots
         vspeed   = f.get("vspeed") # ft/min (store as-is)
 
-        # Logic Fix: on_ground = (alt < 100 ft) AND (gspeed < 30 kts)
+        # FIX-5: on_ground = (alt < 100 ft) AND (gspeed < 30 kts)
+        # Previously: True if alt_ft == 0 else False — wrong for taxi/approach
         on_ground = (
             alt_ft  is not None and alt_ft  < 100 and
             gspeed  is not None and gspeed  < 30
@@ -600,15 +644,19 @@ class FlightIngestionService:
         altitude_m  = float(alt_ft)  * 0.3048 if alt_ft  is not None else None
         velocity_kmh = float(gspeed) * 1.852  if gspeed  is not None else None
 
-        # Business rule: operating_as ONLY
+        # FIX-6: operating_as ONLY — no painted_as fallback
+        # Evidence: Business requirement "Use operating_as ONLY"
         operator_icao = f.get("operating_as")
 
         return RawIngestionPayload(
             icao24=str(icao24).lower()[:6],
+            # FIX-1: fr24_id — FR24 OpenAPI FlightPositionsFull.fr24_id
             fr24_id=f.get("fr24_id"),
             callsign=f.get("callsign"),
+            # FIX-2: flight_number — FR24 OpenAPI FlightPositionsFull.flight
             flight_number=f.get("flight"),
             registration=f.get("reg"),
+            # FIX-4: aircraft_type — FR24 OpenAPI FlightPositionsFull.type
             aircraft_type=f.get("type"),
             operator_icao=operator_icao,
             timestamp=flight_ts,
@@ -617,6 +665,7 @@ class FlightIngestionService:
             altitude=altitude_m or 0.0,
             velocity=velocity_kmh or 0.0,
             heading=float(f.get("track", 0)) if f.get("track") is not None else None,
+            # FIX-3: vspeed_fpm — FR24 OpenAPI FlightPositionsFull.vspeed (ft/min)
             vspeed_fpm=float(vspeed) if vspeed is not None else None,
             on_ground=on_ground,
             est_departure_airport=f.get("orig_icao"),
