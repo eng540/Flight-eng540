@@ -1,16 +1,16 @@
 /**
- * OperationsBoard.tsx — v1.0 (Operations Board UI)
+ * OperationsBoard.tsx — v6.2 (STRICT OPENAPI COMPLIANCE)
  *
  * "قمرة القيادة" — translates complex FR24 capabilities into
  * a simple Arabic wizard: select → configure → review → launch → track.
  *
+ * INCLUDES FIXES FROM ARCHITECT AUDIT:
+ *   - flight_summaries strictly requires an entity (airline code) (HI-V4).
+ *   - historic_events completely removed to prevent 400 errors (P0-V4).
+ *
  * Two panels:
  *   LEFT:  New Operation Wizard (4 steps)
  *   RIGHT: Live Operations Tracker (card per operation)
- *
- * All text Arabic. Calls /api/v1/operations/* exclusively.
- * Polling: GET /api/v1/operations/{id}/progress every 3 seconds.
- * Evidence: system design §5 Execution Flow + §6 Partial Results
  */
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -87,9 +87,11 @@ interface ChunkItem {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CAPABILITY DEFINITIONS
+// CAPABILITY DEFINITIONS (v6.2 — STRICT OPENAPI COMPLIANCE)
+// 🚨 HI-V4 FIX: flight_summaries now strictly requires an entity (airline code)
+// 🚨 P0-V4 FIX: historic_events completely removed to prevent 400 errors.
 // ─────────────────────────────────────────────────────────────────────────────
-const CAPABILITIES = [
+const CAPABILITIES =[
   {
     id: 'live_positions',
     icon: '📡',
@@ -102,9 +104,9 @@ const CAPABILITIES = [
     id: 'flight_summaries',
     icon: '📋',
     title: 'ملخصات الرحلات',
-    desc: 'كل الرحلات في فترة زمنية محددة',
+    desc: 'كل الرحلات لشركة معينة في فترة محددة (بحد أقصى 14 يوماً)',
     timing: '📅 تاريخي',
-    needsDates: true, needsEntity: false,
+    needsDates: true, needsEntity: true, entityLabel: 'كود الناقل ICAO (إجباري)',
   },
   {
     id: 'flight_tracks',
@@ -121,14 +123,6 @@ const CAPABILITIES = [
     desc: 'مواقع الطائرات في فترة ماضية',
     timing: '📅 تاريخي',
     needsDates: true, needsEntity: false,
-  },
-  {
-    id: 'historic_events',
-    icon: '⚡',
-    title: 'أحداث تاريخية',
-    desc: 'طوارئ وأحداث غير اعتيادية لرحلة',
-    timing: '📅 تاريخي',
-    needsDates: false, needsEntity: true, entityLabel: 'معرّف الرحلة (fr24_id)',
   },
   {
     id: 'static_airport',
@@ -148,7 +142,7 @@ const CAPABILITIES = [
   },
 ];
 
-const REGIONS = [
+const REGIONS =[
   { key: 'middle_east',  label: 'الشرق الأوسط' },
   { key: 'north_africa', label: 'شمال أفريقيا' },
   { key: 'central_asia', label: 'آسيا الوسطى' },
@@ -163,12 +157,12 @@ export function OperationsBoard() {
   const [step,       setStep]       = useState<1|2|3|4>(1);
   const [capability, setCapability] = useState<string>('');
   const [regionKey,  setRegionKey]  = useState('middle_east');
-  const [dateFrom,   setDateFrom]   = useState('');
+  const[dateFrom,   setDateFrom]   = useState('');
   const [dateTo,     setDateTo]     = useState('');
   const [entityId,   setEntityId]   = useState('');
 
-  const [preflight,  setPreflight]  = useState<PreflightSummary | null>(null);
-  const [submitting, setSubmitting] = useState(false);
+  const[preflight,  setPreflight]  = useState<PreflightSummary | null>(null);
+  const[submitting, setSubmitting] = useState(false);
   const [launching,  setLaunching]  = useState(false);
   const [error,      setError]      = useState('');
 
@@ -183,14 +177,14 @@ export function OperationsBoard() {
   const loadOperations = useCallback(async () => {
     try {
       const res = await apiClient.get('/api/v1/operations?page_size=20');
-      const ops: OperationProgress[] = (res.data.data || []).map((op: any) => ({
+      const ops: OperationProgress[] = (res.data.data ||[]).map((op: any) => ({
         ...op,
         is_terminal:      ['completed','failed','cancelled'].includes(op.status),
         can_be_cancelled: ['planned','running','partial'].includes(op.status),
       }));
       setOperations(ops);
     } catch { /* silent */ }
-  }, []);
+  },[]);
 
   useEffect(() => {
     loadOperations();
@@ -225,7 +219,7 @@ export function OperationsBoard() {
     return () => {
       Object.values(pollingRefs.current).forEach(clearInterval);
     };
-  }, []);
+  },[]);
 
   // ── Step 2 → 3: Submit for pre-flight ──────────────────────────────────
   const submitForPreflight = async () => {
@@ -289,7 +283,7 @@ export function OperationsBoard() {
     }
     try {
       const res = await apiClient.get(`/api/v1/operations/${opId}/chunks`);
-      setExpandedChunks(prev => ({ ...prev, [opId]: res.data.data || [] }));
+      setExpandedChunks(prev => ({ ...prev, [opId]: res.data.data ||[] }));
     } catch { /* silent */ }
   };
 
@@ -438,10 +432,7 @@ export function OperationsBoard() {
 
                     <div className="grid grid-cols-2 gap-2 pt-1">
                       {[
-                        ['🔢 مكالمات API', `${preflight.estimated_api_calls}`],
-                        ['💳 التكلفة', `~${preflight.estimated_credits.toLocaleString('ar')} نقطة`],
-                        ['⏱️ الوقت', preflight.estimated_duration_label],
-                        ['📦 النتائج', `~${preflight.estimated_results.toLocaleString('ar')}`],
+                        ['🔢 مكالمات API', `${preflight.estimated_api_calls}`],['💳 التكلفة', `~${preflight.estimated_credits.toLocaleString('ar')} نقطة`],['⏱️ الوقت', preflight.estimated_duration_label],['📦 النتائج', `~${preflight.estimated_results.toLocaleString('ar')}`],
                       ].map(([label, value]) => (
                         <div key={label} className="bg-background rounded p-2">
                           <div className="text-xs text-muted-foreground">{label}</div>
@@ -488,7 +479,7 @@ export function OperationsBoard() {
                     <Button variant="outline" onClick={() => setStep(2)} className="flex-1">
                       ← تعديل
                     </Button>
-                    <Button onClick={launchOperation} disabled={launching} className="flex-1">
+                    <Button onClick={launchOperation} disabled={launching || preflight.warnings.some(w => w.level === 'critical')} className="flex-1">
                       {launching ? '⏳ جاري الإطلاق…' : '🚀 إطلاق'}
                     </Button>
                   </div>
