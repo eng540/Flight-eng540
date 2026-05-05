@@ -11,9 +11,9 @@ Evidence §5 Execution Flow:
        db.add(chunk)
    SET operation.chunks_total = len(chunks)"
    
-INCLUDES FIXES FROM ARCHITECT AUDIT (v6.2):
-  - flight_summaries uses 'operating_as' strictly instead of 'airline_icao' (P0-V1).
-  - historic_events entirely eradicated from planning to prevent HTTP 400 (P0-V4).
+UPGRADES (v7.0 — FULL API CAPABILITY EXPOSURE):
+  - Dynamic Endpoint routing: Switch between /light and /full automatically.
+  - Universal Filter mapping: Injects airports, flights, callsigns, categories, etc.
 """
 from __future__ import annotations
 
@@ -125,6 +125,7 @@ class OperationsPlanner:
         """
         cap = operation.capability_type
         params: dict = {}
+        filters = operation.scope_filters or {}
 
         if cap == "live_positions":
             bounds = _build_bounds(operation, plan.region_key)
@@ -133,7 +134,15 @@ class OperationsPlanner:
                     f"{bounds['lamax']},{bounds['lamin']},"
                     f"{bounds['lomin']},{bounds['lomax']}"
                 )
-            params["limit"] = 1500
+            # Universal limit to prevent runaway queries
+            params["limit"] = min(int(filters.get("limit", 1500)), 20000)
+
+            # Extra valid FR24 live filters
+            for k in ["airports", "aircraft", "categories", "data_sources", "squawks"]:
+                if k in filters: params[k] = filters[k]
+            if "gspeed" in filters: params["gspeed"] = filters["gspeed"]
+            if "altitude_ranges" in filters: params["altitude_ranges"] = filters["altitude_ranges"]
+
 
         elif cap == "historic_positions":
             bounds = _build_bounds(operation, plan.region_key)
@@ -142,41 +151,48 @@ class OperationsPlanner:
                     f"{bounds['lamax']},{bounds['lamin']},"
                     f"{bounds['lomin']},{bounds['lomax']}"
                 )
-            # FR24 historic endpoint uses midpoint timestamp of the day
             if plan.date_from:
                 d = date.fromisoformat(plan.date_from)
                 params["timestamp"] = int(datetime(
                     d.year, d.month, d.day, 12, 0, 0,
                     tzinfo=timezone.utc,
                 ).timestamp())
-            params["limit"] = 1500
+                
+            params["limit"] = min(int(filters.get("limit", 1500)), 20000)
+            
+            # Historic positions supports same filters as live
+            for k in["airports", "aircraft", "categories", "data_sources", "squawks", "gspeed", "altitude_ranges"]:
+                if k in filters: params[k] = filters[k]
+
 
         elif cap == "flight_summaries":
             if plan.date_from:
                 params["flight_datetime_from"] = f"{plan.date_from}T00:00:00Z"
             if plan.date_to:
                 params["flight_datetime_to"]   = f"{plan.date_to}T23:59:59Z"
+                
+            # Limit is mandatory in flight_summaries to prevent massive bills
+            params["limit"] = min(int(filters.get("limit", 1500)), 20000)
             
-            # 🚨 FIX P0-V1 & HI-V4: Must use operating_as
+            # Map universal filters supported by flight-summaries
             if operation.scope_entity_id:
                 params["operating_as"] = operation.scope_entity_id
-            if operation.scope_filters:
-                if "operator_icao" in operation.scope_filters:
-                    params["operating_as"] = operation.scope_filters["operator_icao"]
-            params["limit"] = 100
+                
+            valid_filters =["operating_as", "painted_as", "flights", "registrations", 
+                             "callsigns", "airports", "routes", "aircraft", "sort"]
+                             
+            for k in valid_filters:
+                if k in filters and filters[k]:
+                    params[k] = filters[k]
+
 
         elif cap == "flight_tracks":
             if plan.entity_id:
                 params["flight_id"] = plan.entity_id
 
-        # 🚨 FIX P0-V4: historic_events completely removed from planner logic to prevent 400 errors.
 
-        elif cap == "static_airport":
-            # endpoint already contains the code: /api/static/airports/{code}/full
-            # no extra params needed
-            pass
-
-        elif cap == "static_airline":
+        elif cap in ("static_airport", "static_airline"):
+            # Static data doesn't require extra params; the ID is embedded in the URL path.
             pass
 
         return params
