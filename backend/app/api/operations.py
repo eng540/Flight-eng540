@@ -398,6 +398,7 @@ def export_results(
 ):
     """
     Exports all available results as CSV based on the capability type.
+    Handles empty results gracefully with clear messages.
     """
     op = OperationsCRUD.get_by_id(db, operation_id)
     if not op:
@@ -405,36 +406,76 @@ def export_results(
 
     output = io.StringIO()
 
-    # 1. تصدير بيانات المطارات الثابتة
+    # ── Static Airport ────────────────────────────────────────────────────
     if op.capability_type == "static_airport":
         from app.models import DimGeography
-        airport = db.query(DimGeography).filter(DimGeography.icao_code == op.scope_entity_id).first()
-        
+
+        entity_id = op.scope_entity_id
+        if not entity_id:
+            raise HTTPException(
+                status_code=404,
+                detail="لم يتم تحديد رمز مطار عند إنشاء العملية. لا توجد بيانات للتصدير."
+            )
+
+        airport = db.query(DimGeography).filter(
+            DimGeography.icao_code == entity_id
+        ).first()
+
+        if not airport:
+            raise HTTPException(
+                status_code=404,
+                detail=f"المطار {entity_id} غير موجود في قاعدة البيانات."
+            )
+
         writer = csv.DictWriter(output, fieldnames=[
-            "icao_code", "iata_code", "name", "city", "country_code", "latitude", "longitude", "elevation_m"
+            "icao_code", "iata_code", "name", "city", "country_code",
+            "latitude", "longitude", "elevation_m"
         ])
         writer.writeheader()
-        if airport:
-            writer.writerow({
-                "icao_code": airport.icao_code, "iata_code": airport.iata_code, "name": airport.name,
-                "city": airport.city, "country_code": airport.country_code, 
-                "latitude": airport.latitude, "longitude": airport.longitude, "elevation_m": airport.elevation_m
-            })
+        writer.writerow({
+            "icao_code": airport.icao_code,
+            "iata_code": airport.iata_code or "",
+            "name": airport.name,
+            "city": airport.city or "",
+            "country_code": airport.country_code or "",
+            "latitude": airport.latitude or "",
+            "longitude": airport.longitude or "",
+            "elevation_m": airport.elevation_m or "",
+        })
 
-    # 2. تصدير بيانات الناقلين (شركات الطيران) الثابتة
+    # ── Static Airline ────────────────────────────────────────────────────
     elif op.capability_type == "static_airline":
         from app.models import DimOperator
-        operator = db.query(DimOperator).filter(DimOperator.icao_code == op.scope_entity_id).first()
-        
-        writer = csv.DictWriter(output, fieldnames=["icao_code", "iata_code", "name", "country_code"])
-        writer.writeheader()
-        if operator:
-            writer.writerow({
-                "icao_code": operator.icao_code, "iata_code": operator.iata_code,
-                "name": operator.name, "country_code": operator.country_code
-            })
 
-    # 3. تصدير بيانات الرحلات والمواقع (الوضع الافتراضي لباقي العمليات)
+        entity_id = op.scope_entity_id
+        if not entity_id:
+            raise HTTPException(
+                status_code=404,
+                detail="لم يتم تحديد رمز شركة طيران عند إنشاء العملية. لا توجد بيانات للتصدير."
+            )
+
+        operator = db.query(DimOperator).filter(
+            DimOperator.icao_code == entity_id
+        ).first()
+
+        if not operator:
+            raise HTTPException(
+                status_code=404,
+                detail=f"شركة الطيران {entity_id} غير موجودة في قاعدة البيانات."
+            )
+
+        writer = csv.DictWriter(output, fieldnames=[
+            "icao_code", "iata_code", "name", "country_code"
+        ])
+        writer.writeheader()
+        writer.writerow({
+            "icao_code": operator.icao_code,
+            "iata_code": operator.iata_code or "",
+            "name": operator.name,
+            "country_code": operator.country_code or "",
+        })
+
+    # ── Flight Summaries / Live / Historic / Tracks ──────────────────────
     else:
         sessions = (
             db.query(FactFlightSession)
@@ -442,6 +483,13 @@ def export_results(
             .order_by(FactFlightSession.first_seen_ts.asc())
             .all()
         )
+
+        if not sessions:
+            raise HTTPException(
+                status_code=404,
+                detail="لا توجد نتائج جاهزة للتصدير. قد تكون العملية لم تكتمل بعد، أو فشلت القطع (chunks)."
+            )
+
         writer = csv.DictWriter(output, fieldnames=[
             "session_id", "fr24_id", "flight_number", "callsign", "status",
             "aircraft_icao24", "operator", "dep_airport", "arr_airport",
