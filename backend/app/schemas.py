@@ -20,8 +20,7 @@ CHANGES FROM v3.0:
 """
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional, List, Any, Dict
-from datetime import datetime
-
+from datetime import datetime, date
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 1. DIMENSION SCHEMAS (Reference Data)
