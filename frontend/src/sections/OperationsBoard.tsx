@@ -1,13 +1,14 @@
 /**
- * OperationsBoard.tsx — v7.0 (FULL API CAPABILITY EXPOSURE)
+ * OperationsBoard.tsx — v8.0 (FULL API CAPABILITY EXPOSURE)
  *
  * "قمرة القيادة" — translates complex FR24 capabilities into
  * a simple Arabic wizard: select → configure → review → launch → track.
  *
  * INCLUDES UPGRADES:
  *   - Schema Toggling: Users can now select "Light" vs "Full" schema.
- *   - Universal Filters: Flight Summaries now accepts Airports, Call signs, 
- *     Registrations, and Aircraft Types, not just Operating As.
+ *   - Universal Filters: Added support for Airports, Call signs, 
+ *     Registrations, Aircraft Types, and now Routes (ICAO1-ICAO2).
+ *   - Region-to-Airport resolution is handled silently by the backend.
  */
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -99,7 +100,7 @@ const CAPABILITIES =[
     id: 'flight_summaries',
     icon: '📋',
     title: 'ملخصات الرحلات',
-    desc: 'سجل الرحلات مع خيارات فلترة شاملة (مطار، شركة، نوع طائرة)',
+    desc: 'سجل الرحلات مع خيارات فلترة شاملة (مطار، شركة، نوع طائرة، مسارات)',
     timing: '📅 تاريخي',
     needsDates: true, needsEntity: false, needsFilters: true,
   },
@@ -149,27 +150,28 @@ const REGIONS =[
 // MAIN COMPONENT
 // ─────────────────────────────────────────────────────────────────────────────
 export function OperationsBoard() {
-  const [step,       setStep]       = useState<1|2|3|4>(1);
-  const [capability, setCapability] = useState<string>('');
+  const[step,       setStep]       = useState<1|2|3|4>(1);
+  const[capability, setCapability] = useState<string>('');
   const [regionKey,  setRegionKey]  = useState('middle_east');
   const[dateFrom,   setDateFrom]   = useState('');
-  const [dateTo,     setDateTo]     = useState('');
+  const[dateTo,     setDateTo]     = useState('');
   const [entityId,   setEntityId]   = useState('');
 
   // Flight Summaries Filters
   const[schemaMode, setSchemaMode] = useState('full');
   const [filterOp, setFilterOp]     = useState('');
-  const [filterAirports, setFilterAirports] = useState('');
+  const[filterAirports, setFilterAirports] = useState('');
   const[filterAircraft, setFilterAircraft] = useState('');
   const [filterCallsigns, setFilterCallsigns] = useState('');
   const [filterReg, setFilterReg] = useState('');
+  const [filterRoutes, setFilterRoutes] = useState(''); // NEW: Routes filter
 
   const [preflight,  setPreflight]  = useState<PreflightSummary | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [launching,  setLaunching]  = useState(false);
   const[error,      setError]      = useState('');
 
-  const [operations, setOperations] = useState<OperationProgress[]>([]);
+  const[operations, setOperations] = useState<OperationProgress[]>([]);
   const [expandedChunks, setExpandedChunks] = useState<Record<number, ChunkItem[]>>({});
 
   const pollingRefs = useRef<Record<number, ReturnType<typeof setInterval>>>({});
@@ -243,6 +245,7 @@ export function OperationsBoard() {
           aircraft: filterAircraft.trim().toUpperCase() || undefined,
           callsigns: filterCallsigns.trim().toUpperCase() || undefined,
           registrations: filterReg.trim().toUpperCase() || undefined,
+          routes: filterRoutes.trim().toUpperCase() || undefined, // Include Routes
         };
       }
 
@@ -276,7 +279,7 @@ export function OperationsBoard() {
         setStep(1); setCapability(''); setPreflight(null);
         setDateFrom(''); setDateTo(''); setEntityId('');
         setFilterOp(''); setFilterAirports(''); setFilterAircraft('');
-        setFilterCallsigns(''); setFilterReg('');
+        setFilterCallsigns(''); setFilterReg(''); setFilterRoutes('');
       }, 3000);
     } catch (e: any) {
       setError(e.response?.data?.detail || 'فشل إطلاق العملية');
@@ -386,10 +389,10 @@ export function OperationsBoard() {
 
                   <p className="text-sm text-muted-foreground">على ماذا؟</p>
 
-                  {/* Region (for non-entity, non-filter endpoints) */}
-                  {!capMeta.needsEntity && !capMeta.needsFilters && (
+                  {/* Region (for non-entity, non-filter endpoints or as fallback) */}
+                  {!capMeta.needsEntity && (
                     <div className="space-y-1">
-                      <Label className="text-xs">المنطقة الجغرافية</Label>
+                      <Label className="text-xs">المنطقة الجغرافية {capMeta.needsFilters && "(تُستخدم إذا لم تُدخل أي فلتر)"}</Label>
                       <Select value={regionKey} onValueChange={setRegionKey}>
                         <SelectTrigger><SelectValue /></SelectTrigger>
                         <SelectContent>
@@ -427,7 +430,7 @@ export function OperationsBoard() {
                     </div>
                   )}
 
-                  {/* Flight Summaries Filters (Dynamic Schema) */}
+                  {/* Flight Summaries Filters (Dynamic Schema & Universal Filters) */}
                   {capMeta.needsFilters && (
                     <div className="space-y-3 pt-2 border-t mt-2">
                       
@@ -442,7 +445,7 @@ export function OperationsBoard() {
                         </Select>
                       </div>
 
-                      <p className="text-xs text-muted-foreground font-medium">يجب تعبئة حقل واحد على الأقل من الفلاتر التالية:</p>
+                      <p className="text-xs text-muted-foreground font-medium">يمكنك إدخال فلتر واحد أو دمج عدة فلاتر:</p>
 
                       <div className="grid grid-cols-2 gap-2">
                         <div className="space-y-1">
@@ -458,8 +461,8 @@ export function OperationsBoard() {
                           <Input placeholder="مثال: B77W" value={filterAircraft} onChange={e => setFilterAircraft(e.target.value)} />
                         </div>
                         <div className="space-y-1">
-                          <Label className="text-xs">تسجيل الطائرة</Label>
-                          <Input placeholder="مثال: HZ-AK11" value={filterReg} onChange={e => setFilterReg(e.target.value)} />
+                          <Label className="text-xs">مسار الرحلة (Route)</Label>
+                          <Input placeholder="مثال: OERK-EGLL" value={filterRoutes} onChange={e => setFilterRoutes(e.target.value)} />
                         </div>
                       </div>
                     </div>
@@ -488,8 +491,7 @@ export function OperationsBoard() {
 
                     <div className="grid grid-cols-2 gap-2 pt-1">
                       {[['🔢 مكالمات API', `${preflight.estimated_api_calls}`],['💳 التكلفة', `~${preflight.estimated_credits.toLocaleString('ar')} نقطة`],
-                        ['⏱️ الوقت', preflight.estimated_duration_label],
-                        ['📦 النتائج', `~${preflight.estimated_results.toLocaleString('ar')}`],
+                        ['⏱️ الوقت', preflight.estimated_duration_label],['📦 النتائج', `~${preflight.estimated_results.toLocaleString('ar')}`],
                       ].map(([label, value]) => (
                         <div key={label} className="bg-background rounded p-2 border">
                           <div className="text-xs text-muted-foreground">{label}</div>
