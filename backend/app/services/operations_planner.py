@@ -11,10 +11,11 @@ Evidence §5 Execution Flow:
        db.add(chunk)
    SET operation.chunks_total = len(chunks)"
    
-UPGRADES (v8.0 — ADVANCED REGION-TO-AIRPORT RESOLUTION):
-  - Solves the Region to Airport lookup for flight_summaries.
-  - Slices large airport lists into compliant chunks of max 15 airports (FR24 limits).
-  - Routes filter explicitly supported.
+UPGRADES (v8.2 — FINAL OPENAPI COMPLIANCE):
+  - Advanced Region-to-Airport resolution for flight_summaries.
+  - Slices large airport lists into compliant chunks of max 15 airports.
+  - Corrected filter mapping: airline_icao for airline, painted_as for livery.
+  - Full support for all valid FR24 flight summary filters.
 """
 from __future__ import annotations
 
@@ -40,36 +41,24 @@ class OperationsPlanner:
 
     @staticmethod
     def create_chunks(db: Session, operation: Operation) -> List[OperationChunk]:
-        """
-        Translates the operation scope into concrete OperationChunk rows.
-        Returns the created chunks (already flushed, not yet committed).
-        """
         engine     = PreflightEngine(db)
-        # Using base plan to determine timelines
         base_chunk_plan = engine._build_chunk_plan(operation)
 
         chunks: List[OperationChunk] =[]
         final_chunk_index = 0
 
         for plan in base_chunk_plan:
-            # 🚨 ADVANCED FIX (Region to Airport Resolution)
-            # For flight_summaries, if no specific entity/filter is provided but a region is,
-            # we MUST convert the region's bounding box into actual ICAO airport codes.
-            # FR24 API limit: max 15 airports per request.
-            
-            airport_batches =[None] # Default to 1 batch with no airport override
+            airport_batches = [None]
             
             if operation.capability_type == "flight_summaries":
                 filters = operation.scope_filters or {}
                 has_entity_filter = operation.scope_entity_id or any(
-                    k in filters and filters[k] for k in["operating_as", "painted_as", "flights", "registrations", "callsigns", "airports", "routes", "aircraft"]
+                    k in filters and filters[k] for k in["airline_icao", "painted_as", "flights", "registrations", "callsigns", "airports", "routes", "aircraft"]
                 )
                 
-                # If no explicit filters, we must derive airports from the region bounds
                 if not has_entity_filter and plan.region_key:
                     bounds = _build_bounds(operation, plan.region_key)
                     if bounds:
-                        # Find all airports inside this bounding box
                         airports_in_region = db.query(DimGeography.icao_code).filter(
                             and_(
                                 DimGeography.latitude <= bounds['lamax'],
@@ -80,13 +69,11 @@ class OperationsPlanner:
                             )
                         ).all()
                         
-                        icao_list =[a[0] for a in airports_in_region if len(a[0]) == 4]
+                        icao_list = [a[0] for a in airports_in_region if len(a[0]) == 4]
                         
                         if icao_list:
-                            # Slice into batches of 15
                             airport_batches = [icao_list[i:i + 15] for i in range(0, len(icao_list), 15)]
 
-            # Generate chunks (multiplying temporal chunks by airport batches if needed)
             for batch in airport_batches:
                 fr24_params = OperationsPlanner._build_fr24_params(operation, plan, batch)
 
@@ -131,9 +118,6 @@ class OperationsPlanner:
 
     @staticmethod
     def _build_fr24_params(operation: Operation, plan, airport_batch_override: List[str] = None) -> dict:
-        """
-        Builds the exact parameters dict to pass to FR24 API.
-        """
         cap = operation.capability_type
         params: dict = {}
         filters = operation.scope_filters or {}
@@ -144,7 +128,7 @@ class OperationsPlanner:
                 params["bounds"] = f"{bounds['lamax']},{bounds['lamin']},{bounds['lomin']},{bounds['lomax']}"
             params["limit"] = min(int(filters.get("limit", 1500)), 20000)
 
-            for k in["airports", "aircraft", "categories", "data_sources", "squawks"]:
+            for k in ["airports", "aircraft", "categories", "data_sources", "squawks"]:
                 if k in filters: params[k] = filters[k]
             if "gspeed" in filters: params["gspeed"] = filters["gspeed"]
             if "altitude_ranges" in filters: params["altitude_ranges"] = filters["altitude_ranges"]
@@ -170,14 +154,19 @@ class OperationsPlanner:
                 
             params["limit"] = min(int(filters.get("limit", 1500)), 20000)
             
-            # Map explicit universal filters
+            # Map the airline filter correctly. The UI sends 'operating_as' as a convenience key.
+            # We translate it to the API-compliant 'airline_icao' parameter.
             if operation.scope_entity_id:
-                params["operating_as"] = operation.scope_entity_id
+                params["airline_icao"] = operation.scope_entity_id
                 
-            valid_filters =["operating_as", "painted_as", "flights", "registrations", "callsigns", "airports", "routes", "aircraft", "sort"]
+            # All valid FR24 filter parameters for flight summaries
+            valid_filters =["airline_icao", "painted_as", "flights", "registrations", "callsigns", "airports", "routes", "aircraft", "sort"]
                              
             for k in valid_filters:
-                if k in filters and filters[k]:
+                # Handle the translation from frontend key 'operating_as' to API key 'airline_icao'
+                if k == "airline_icao" and "operating_as" in filters and filters["operating_as"]:
+                    params[k] = filters["operating_as"]
+                elif k in filters and filters[k]:
                     params[k] = filters[k]
 
             # Override with region-based airports if provided by the planner
@@ -194,10 +183,7 @@ class OperationsPlanner:
         return params
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ── HELPERS ─────────────────────────────────────────────────────────────────
 def _build_bounds(operation: Operation, region_key=None) -> dict:
     if operation.scope_bounds:
         return operation.scope_bounds
