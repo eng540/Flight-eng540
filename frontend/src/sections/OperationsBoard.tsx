@@ -1,17 +1,13 @@
 /**
- * OperationsBoard.tsx — v6.3 (STRICT OPENAPI COMPLIANCE & UI FIXES)
+ * OperationsBoard.tsx — v7.0 (FULL API CAPABILITY EXPOSURE)
  *
  * "قمرة القيادة" — translates complex FR24 capabilities into
  * a simple Arabic wizard: select → configure → review → launch → track.
  *
- * INCLUDES FIXES:
- *   - flight_summaries strictly requires an entity (airline code) to prevent HTTP 400.
- *   - historic_events completely removed to prevent 400 errors.
- *   - UI explicitly asks for required inputs based on the capability.
- *
- * Two panels:
- *   LEFT:  New Operation Wizard (4 steps)
- *   RIGHT: Live Operations Tracker (card per operation)
+ * INCLUDES UPGRADES:
+ *   - Schema Toggling: Users can now select "Light" vs "Full" schema.
+ *   - Universal Filters: Flight Summaries now accepts Airports, Call signs, 
+ *     Registrations, and Aircraft Types, not just Operating As.
  */
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -97,15 +93,15 @@ const CAPABILITIES =[
     title: 'رصد حي',
     desc: 'أين الطائرات الآن فوق منطقتي؟',
     timing: '⚡ فوري',
-    needsDates: false, needsEntity: false,
+    needsDates: false, needsEntity: false, needsFilters: false,
   },
   {
     id: 'flight_summaries',
     icon: '📋',
     title: 'ملخصات الرحلات',
-    desc: 'كل الرحلات لشركة معينة في فترة محددة (بحد أقصى 14 يوماً)',
+    desc: 'سجل الرحلات مع خيارات فلترة شاملة (مطار، شركة، نوع طائرة)',
     timing: '📅 تاريخي',
-    needsDates: true, needsEntity: true, entityLabel: 'كود الناقل ICAO (إجباري 3 أحرف)',
+    needsDates: true, needsEntity: false, needsFilters: true,
   },
   {
     id: 'flight_tracks',
@@ -113,7 +109,7 @@ const CAPABILITIES =[
     title: 'مسار رحلة',
     desc: 'أرسم المسار الكامل لرحلة بعينها',
     timing: '📅 تاريخي',
-    needsDates: false, needsEntity: true, entityLabel: 'معرّف الرحلة (fr24_id)',
+    needsDates: false, needsEntity: true, entityLabel: 'معرّف الرحلة (fr24_id)', needsFilters: false,
   },
   {
     id: 'historic_positions',
@@ -121,7 +117,7 @@ const CAPABILITIES =[
     title: 'مواقع تاريخية',
     desc: 'مواقع الطائرات في فترة ماضية',
     timing: '📅 تاريخي',
-    needsDates: true, needsEntity: false,
+    needsDates: true, needsEntity: false, needsFilters: false,
   },
   {
     id: 'static_airport',
@@ -129,7 +125,7 @@ const CAPABILITIES =[
     title: 'بيانات مطار',
     desc: 'معلومات ثابتة عن مطار (اسم، إحداثيات، ارتفاع)',
     timing: '🆓 مجاني',
-    needsDates: false, needsEntity: true, entityLabel: 'كود المطار ICAO',
+    needsDates: false, needsEntity: true, entityLabel: 'كود المطار ICAO', needsFilters: false,
   },
   {
     id: 'static_airline',
@@ -137,7 +133,7 @@ const CAPABILITIES =[
     title: 'بيانات ناقل',
     desc: 'معلومات ثابتة عن شركة طيران',
     timing: '🆓 مجاني',
-    needsDates: false, needsEntity: true, entityLabel: 'كود الناقل ICAO',
+    needsDates: false, needsEntity: true, entityLabel: 'كود الناقل ICAO', needsFilters: false,
   },
 ];
 
@@ -156,9 +152,17 @@ export function OperationsBoard() {
   const [step,       setStep]       = useState<1|2|3|4>(1);
   const [capability, setCapability] = useState<string>('');
   const [regionKey,  setRegionKey]  = useState('middle_east');
-  const [dateFrom,   setDateFrom]   = useState('');
+  const[dateFrom,   setDateFrom]   = useState('');
   const [dateTo,     setDateTo]     = useState('');
-  const[entityId,   setEntityId]   = useState('');
+  const [entityId,   setEntityId]   = useState('');
+
+  // Flight Summaries Filters
+  const[schemaMode, setSchemaMode] = useState('full');
+  const [filterOp, setFilterOp]     = useState('');
+  const [filterAirports, setFilterAirports] = useState('');
+  const[filterAircraft, setFilterAircraft] = useState('');
+  const [filterCallsigns, setFilterCallsigns] = useState('');
+  const [filterReg, setFilterReg] = useState('');
 
   const [preflight,  setPreflight]  = useState<PreflightSummary | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -199,8 +203,8 @@ export function OperationsBoard() {
         const res = await apiClient.get(`/api/v1/operations/${opId}/progress`);
         const prog: OperationProgress = {
           ...res.data,
-          is_terminal:      ['completed','failed','cancelled'].includes(res.data.status),
-          can_be_cancelled: ['planned','running','partial'].includes(res.data.status),
+          is_terminal:['completed','failed','cancelled'].includes(res.data.status),
+          can_be_cancelled:['planned','running','partial'].includes(res.data.status),
         };
         setOperations(prev =>
           prev.map(op => op.id === opId ? { ...op, ...prog } : op)
@@ -229,6 +233,18 @@ export function OperationsBoard() {
       if (capMeta?.needsDates && dateFrom) scope.date_from = dateFrom;
       if (capMeta?.needsDates && dateTo)   scope.date_to   = dateTo;
       if (capMeta?.needsEntity && entityId) scope.entity_id = entityId.trim();
+
+      // Bundle flight_summaries filters
+      if (capMeta?.needsFilters) {
+        scope.filters = {
+          schema_mode: schemaMode,
+          operating_as: filterOp.trim().toUpperCase() || undefined,
+          airports: filterAirports.trim().toUpperCase() || undefined,
+          aircraft: filterAircraft.trim().toUpperCase() || undefined,
+          callsigns: filterCallsigns.trim().toUpperCase() || undefined,
+          registrations: filterReg.trim().toUpperCase() || undefined,
+        };
+      }
 
       const res = await apiClient.post('/api/v1/operations', {
         capability_type: capability,
@@ -259,6 +275,8 @@ export function OperationsBoard() {
       setTimeout(() => {
         setStep(1); setCapability(''); setPreflight(null);
         setDateFrom(''); setDateTo(''); setEntityId('');
+        setFilterOp(''); setFilterAirports(''); setFilterAircraft('');
+        setFilterCallsigns(''); setFilterReg('');
       }, 3000);
     } catch (e: any) {
       setError(e.response?.data?.detail || 'فشل إطلاق العملية');
@@ -368,8 +386,8 @@ export function OperationsBoard() {
 
                   <p className="text-sm text-muted-foreground">على ماذا؟</p>
 
-                  {/* Region */}
-                  {!capMeta.needsEntity && (
+                  {/* Region (for non-entity, non-filter endpoints) */}
+                  {!capMeta.needsEntity && !capMeta.needsFilters && (
                     <div className="space-y-1">
                       <Label className="text-xs">المنطقة الجغرافية</Label>
                       <Select value={regionKey} onValueChange={setRegionKey}>
@@ -400,7 +418,7 @@ export function OperationsBoard() {
                   )}
 
                   {/* Entity */}
-                  {capMeta.needsEntity && (
+                  {capMeta.needsEntity && !capMeta.needsFilters && (
                     <div className="space-y-1">
                       <Label className="text-xs">{capMeta.entityLabel}</Label>
                       <Input placeholder="أدخل المعرّف..."
@@ -409,13 +427,51 @@ export function OperationsBoard() {
                     </div>
                   )}
 
+                  {/* Flight Summaries Filters (Dynamic Schema) */}
+                  {capMeta.needsFilters && (
+                    <div className="space-y-3 pt-2 border-t mt-2">
+                      
+                      <div className="space-y-1">
+                        <Label className="text-xs font-bold text-primary">نوع البيانات (Schema)</Label>
+                        <Select value={schemaMode} onValueChange={setSchemaMode}>
+                          <SelectTrigger><SelectValue /></SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="light">بيانات أساسية (أرخص وأسرع)</SelectItem>
+                            <SelectItem value="full">بيانات كاملة (تتضمن المدارج والمسافة)</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+
+                      <p className="text-xs text-muted-foreground font-medium">يجب تعبئة حقل واحد على الأقل من الفلاتر التالية:</p>
+
+                      <div className="grid grid-cols-2 gap-2">
+                        <div className="space-y-1">
+                          <Label className="text-xs">كود الشركة (ICAO)</Label>
+                          <Input placeholder="مثال: SVA" value={filterOp} onChange={e => setFilterOp(e.target.value)} />
+                        </div>
+                        <div className="space-y-1">
+                          <Label className="text-xs">كود المطار (ICAO/IATA)</Label>
+                          <Input placeholder="مثال: inbound:OERK" value={filterAirports} onChange={e => setFilterAirports(e.target.value)} />
+                        </div>
+                        <div className="space-y-1">
+                          <Label className="text-xs">نوع الطائرة (ICAO)</Label>
+                          <Input placeholder="مثال: B77W" value={filterAircraft} onChange={e => setFilterAircraft(e.target.value)} />
+                        </div>
+                        <div className="space-y-1">
+                          <Label className="text-xs">تسجيل الطائرة</Label>
+                          <Input placeholder="مثال: HZ-AK11" value={filterReg} onChange={e => setFilterReg(e.target.value)} />
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
                   {error && (
-                    <p className="text-xs text-destructive">{error}</p>
+                    <p className="text-xs text-destructive bg-destructive/10 p-2 rounded">{error}</p>
                   )}
 
                   <Button onClick={submitForPreflight}
-                    disabled={submitting || (capMeta.needsEntity && !entityId.trim())}
-                    className="w-full">
+                    disabled={submitting}
+                    className="w-full mt-2">
                     {submitting ? '⏳ جاري الحساب…' : '📋 احسب التكلفة'}
                   </Button>
                 </div>
@@ -435,7 +491,7 @@ export function OperationsBoard() {
                         ['⏱️ الوقت', preflight.estimated_duration_label],
                         ['📦 النتائج', `~${preflight.estimated_results.toLocaleString('ar')}`],
                       ].map(([label, value]) => (
-                        <div key={label} className="bg-background rounded p-2">
+                        <div key={label} className="bg-background rounded p-2 border">
                           <div className="text-xs text-muted-foreground">{label}</div>
                           <div className="font-bold text-sm">{value}</div>
                         </div>
@@ -444,18 +500,18 @@ export function OperationsBoard() {
 
                     {/* Chunk plan preview */}
                     <div className="space-y-1 pt-1">
-                      <div className="text-xs font-medium">خطة التنفيذ:</div>
-                      <div className="max-h-32 overflow-y-auto space-y-0.5">
+                      <div className="text-xs font-medium border-b pb-1 mb-1">خطة تقطيع التنفيذ (Auto-Chunking):</div>
+                      <div className="max-h-32 overflow-y-auto space-y-0.5 pr-1">
                         {preflight.chunk_plan.slice(0, 5).map(c => (
                           <div key={c.chunk_index}
                             className="flex justify-between text-xs text-muted-foreground">
                             <span>⏸️ {c.label}</span>
-                            <span>{c.estimated_credits} نقطة</span>
+                            <span className="font-mono">{c.estimated_credits} pt</span>
                           </div>
                         ))}
                         {preflight.chunk_plan.length > 5 && (
-                          <div className="text-xs text-muted-foreground">
-                            + {preflight.chunk_plan.length - 5} مزيد…
+                          <div className="text-xs text-muted-foreground mt-1 font-medium">
+                            + {preflight.chunk_plan.length - 5} دفعات أخرى مجدولة…
                           </div>
                         )}
                       </div>
@@ -463,13 +519,13 @@ export function OperationsBoard() {
 
                     {/* Warnings */}
                     {preflight.warnings.map((w, i) => (
-                      <div key={i} className={`text-xs p-2 rounded ${
-                        w.level === 'critical' ? 'bg-destructive/10 text-destructive' :
-                        w.level === 'warning'  ? 'bg-yellow-500/10 text-yellow-700' :
-                        'bg-blue-500/10 text-blue-700'
+                      <div key={i} className={`text-xs p-2 rounded border mt-2 ${
+                        w.level === 'critical' ? 'bg-destructive/10 text-destructive border-destructive/20' :
+                        w.level === 'warning'  ? 'bg-yellow-500/10 text-yellow-700 border-yellow-500/20' :
+                        'bg-blue-500/10 text-blue-700 border-blue-500/20'
                       }`}>
-                        {w.level === 'critical' ? '⚠️' :
-                         w.level === 'warning'  ? '⚠' : 'ℹ️'} {w.message}
+                        {w.level === 'critical' ? '⚠️ ' :
+                         w.level === 'warning'  ? '⚠ ' : 'ℹ️ '} {w.message}
                       </div>
                     ))}
                   </div>
@@ -478,7 +534,7 @@ export function OperationsBoard() {
 
                   <div className="flex gap-2">
                     <Button variant="outline" onClick={() => setStep(2)} className="flex-1">
-                      ← تعديل
+                      ← تعديل الفلاتر
                     </Button>
                     <Button onClick={launchOperation} disabled={launching || preflight.warnings.some(w => w.level === 'critical')} className="flex-1">
                       {launching ? '⏳ جاري الإطلاق…' : '🚀 إطلاق'}
@@ -490,10 +546,10 @@ export function OperationsBoard() {
               {/* ── STEP 4: Launched confirmation ─── */}
               {step === 4 && (
                 <div className="text-center py-8 space-y-2">
-                  <div className="text-4xl">🚀</div>
-                  <div className="font-bold">تم إطلاق العملية!</div>
+                  <div className="text-4xl animate-bounce">🚀</div>
+                  <div className="font-bold">تم الإطلاق بنجاح!</div>
                   <div className="text-xs text-muted-foreground">
-                    تابع التقدم في لوحة المهمات →
+                    نظام الجدولة الذكي يقوم الآن بالتعامل مع API Flightradar24.
                   </div>
                 </div>
               )}
@@ -508,14 +564,14 @@ export function OperationsBoard() {
         <div className="lg:col-span-3 space-y-3">
           <div className="flex items-center justify-between">
             <h2 className="text-base font-bold">📊 لوحة تتبع المهمات</h2>
-            <Button variant="ghost" size="sm" onClick={loadOperations}>🔄</Button>
+            <Button variant="ghost" size="sm" onClick={loadOperations}>🔄 تحديث</Button>
           </div>
 
           {operations.length === 0 ? (
-            <div className="text-center py-16 text-muted-foreground">
+            <div className="text-center py-16 text-muted-foreground border rounded-lg bg-card">
               <div className="text-4xl mb-2">📭</div>
-              <p className="text-sm">لا توجد عمليات بعد</p>
-              <p className="text-xs">أنشئ عملية جديدة من القائمة على اليمين</p>
+              <p className="text-sm font-medium">لا توجد عمليات بعد</p>
+              <p className="text-xs mt-1">أنشئ عملية جديدة من القائمة على اليمين لتجربة قدرات الـ API</p>
             </div>
           ) : (
             operations.map(op => (
@@ -575,13 +631,13 @@ function OperationCard({
           <span className="text-xl">{sc.icon}</span>
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
-              <span className="font-bold text-sm">{op.operation_ref}</span>
-              <Badge variant="outline" className="text-xs">{sc.label}</Badge>
-              <span className="text-xs text-muted-foreground">{op.capability_type}</span>
+              <span className="font-bold text-sm font-mono">{op.operation_ref}</span>
+              <Badge variant="outline" className={`text-xs ${op.status === 'running' ? 'animate-pulse' : ''}`}>{sc.label}</Badge>
+              <span className="text-xs text-muted-foreground bg-muted px-2 py-0.5 rounded-full">{op.capability_type}</span>
             </div>
             {op.cancel_requested && !op.is_terminal && (
               <div className="text-xs text-destructive mt-1 font-medium animate-pulse">
-                ⏳ جاري إيقاف العملية وإلغاء الارتباطات...
+                ⏳ جاري إيقاف العملية وإلغاء الدفعات المتبقية...
               </div>
             )}
           </div>
@@ -589,52 +645,54 @@ function OperationCard({
 
         {/* Progress bar */}
         <div className="space-y-1">
-          <div className="flex justify-between text-xs text-muted-foreground">
-            <span>{op.chunks_completed} / {op.chunks_total} chunks</span>
+          <div className="flex justify-between text-xs text-muted-foreground font-medium">
+            <span>{op.chunks_completed} / {op.chunks_total} دفعات</span>
             <span>{op.progress_pct}%</span>
           </div>
-          <div className="w-full bg-muted rounded-full h-2">
+          <div className="w-full bg-muted rounded-full h-2 overflow-hidden border">
             <div
-              className={`h-2 rounded-full transition-all ${sc.color}`}
+              className={`h-full transition-all duration-500 ${sc.color}`}
               style={{ width: `${Math.min(op.progress_pct, 100)}%` }}
             />
           </div>
         </div>
 
         {/* Stats row */}
-        <div className="flex gap-4 text-xs text-muted-foreground">
-          <span>📦 {op.total_results_count.toLocaleString('ar')} نتيجة</span>
-          <span>💳 {op.actual_credits_used} / {op.estimated_credits} نقطة</span>
+        <div className="flex gap-4 text-xs font-medium text-muted-foreground bg-muted/30 p-2 rounded border">
+          <span className="flex items-center gap-1">📦 {op.total_results_count.toLocaleString('ar')} نتيجة</span>
+          <span className="flex items-center gap-1">💳 {op.actual_credits_used} / {op.estimated_credits} نقطة</span>
           {op.chunks_failed > 0 && (
-            <span className="text-destructive">❌ {op.chunks_failed} فشل</span>
+            <span className="text-destructive flex items-center gap-1">❌ {op.chunks_failed} فشل</span>
           )}
         </div>
 
         {/* Current chunk indicator */}
         {op.current_chunk && !op.is_terminal && !op.cancel_requested && (
-          <div className="text-xs bg-yellow-500/10 rounded p-2">
-            ⏳ جاري الآن: {String((op.current_chunk as any).date_from || (op.current_chunk as any).entity_id || '—')}
+          <div className="text-xs bg-yellow-500/10 border border-yellow-500/20 rounded p-2 text-yellow-800 dark:text-yellow-200">
+            <span className="animate-pulse mr-1">⏳</span> جاري الآن: <span className="font-mono" dir="ltr">{String((op.current_chunk as any).date_from || (op.current_chunk as any).entity_id || '—')}</span>
           </div>
         )}
-        {op.last_completed_chunk && (
-          <div className="text-xs bg-green-500/10 rounded p-2">
-            ✅ آخر مكتمل: {String((op.last_completed_chunk as any).date_from || '—')}
-            {' · '}{((op.last_completed_chunk as any).results_count || 0).toLocaleString('ar')} نتيجة
+        {op.last_completed_chunk && op.is_terminal && op.status === 'completed' && (
+          <div className="text-xs bg-green-500/10 border border-green-500/20 rounded p-2 text-green-800 dark:text-green-200">
+            ✅ اكتملت بنجاح: تم سحب <span className="font-bold">{((op.last_completed_chunk as any).results_count || 0).toLocaleString('ar')}</span> نتيجة في آخر دفعة.
           </div>
         )}
 
         {/* Chunks detail */}
         {chunks && (
-          <div className="space-y-0.5 max-h-40 overflow-y-auto">
+          <div className="space-y-0.5 max-h-40 overflow-y-auto bg-background rounded border p-1">
             {chunks.map(c => (
               <div key={c.chunk_index}
-                className="flex items-center justify-between text-xs py-0.5">
-                <span>{c.status_icon} {c.label}</span>
+                className="flex items-center justify-between text-xs py-1 px-2 border-b last:border-0 hover:bg-muted/50">
+                <span className="flex items-center gap-2">
+                  <span className="w-4">{c.status_icon}</span> 
+                  <span className="font-mono" dir="ltr">{c.label}</span>
+                </span>
                 <div className="flex gap-3 text-muted-foreground">
-                  {c.results_count > 0 && <span>{c.results_count.toLocaleString('ar')}</span>}
+                  {c.results_count > 0 && <span className="bg-primary/10 text-primary px-1.5 rounded">{c.results_count.toLocaleString('ar')}</span>}
                   {c.last_error && (
-                    <span className="text-destructive truncate max-w-24" title={c.last_error}>
-                      خطأ
+                    <span className="text-destructive truncate max-w-32 bg-destructive/10 px-1.5 rounded" title={c.last_error}>
+                      {c.last_error}
                     </span>
                   )}
                 </div>
@@ -644,23 +702,23 @@ function OperationCard({
         )}
 
         {/* Action buttons */}
-        <div className="flex gap-1.5 flex-wrap">
-          <Button variant="outline" size="sm" className="text-xs h-7"
+        <div className="flex gap-2 flex-wrap pt-1">
+          <Button variant="secondary" size="sm" className="text-xs h-7"
             onClick={onToggleChunks}>
-            {chunks ? '🔼 إخفاء' : '🔽 تفاصيل'}
+            {chunks ? '🔼 إخفاء الدفعات' : '🔽 تفاصيل الدفعات'}
           </Button>
 
           {op.total_results_count > 0 && (
-            <Button variant="outline" size="sm" className="text-xs h-7"
+            <Button variant="default" size="sm" className="text-xs h-7 shadow-sm"
               onClick={onExport}>
-              📥 تصدير CSV
+              📥 تصدير البيانات (CSV)
             </Button>
           )}
 
           {op.can_be_cancelled && !op.cancel_requested && (
-            <Button variant="outline" size="sm" className="text-xs h-7 text-destructive"
+            <Button variant="destructive" size="sm" className="text-xs h-7 ml-auto"
               onClick={onCancel}>
-              🛑 إلغاء فوري
+              🛑 إيقاف قسري
             </Button>
           )}
         </div>
