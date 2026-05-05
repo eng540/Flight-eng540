@@ -540,7 +540,7 @@ export function OperationsBoard() {
                     <Button variant="outline" onClick={() => setStep(2)} className="flex-1">
                       ← تعديل الفلاتر
                     </Button>
-                    <Button onClick={launchOperation} disabled={launching || preflight.warnings.some(w => w.level === 'critical')} className="flex-1">
+                    <Button onClick={launchOperation} disabled={launching || preflight.warnings.some(w => w.level === 'critical' && w.code !== 'MISSING_ENTITY')} className="flex-1">
                       {launching ? '⏳ جاري الإطلاق…' : '🚀 إطلاق'}
                     </Button>
                   </div>
