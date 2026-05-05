@@ -9,6 +9,7 @@
  *   - Universal Filters: Added support for Airports, Call signs, 
  *     Registrations, Aircraft Types, and now Routes (ICAO1-ICAO2).
  *   - Region-to-Airport resolution is handled silently by the backend.
+ *   - STRICT OPENAPI FIX: 'operating_as' replaced with 'airline_icao'.
  */
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -240,12 +241,13 @@ export function OperationsBoard() {
       if (capMeta?.needsFilters) {
         scope.filters = {
           schema_mode: schemaMode,
-          operating_as: filterOp.trim().toUpperCase() || undefined,
+          // STRICT OPENAPI FIX: Replaced 'operating_as' with the correct parameter 'airline_icao'.
+          airline_icao: filterOp.trim().toUpperCase() || undefined,
           airports: filterAirports.trim().toUpperCase() || undefined,
           aircraft: filterAircraft.trim().toUpperCase() || undefined,
           callsigns: filterCallsigns.trim().toUpperCase() || undefined,
           registrations: filterReg.trim().toUpperCase() || undefined,
-          routes: filterRoutes.trim().toUpperCase() || undefined, // Include Routes
+          routes: filterRoutes.trim().toUpperCase() || undefined,
         };
       }
 
