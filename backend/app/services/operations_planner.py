@@ -69,7 +69,7 @@ class OperationsPlanner:
                             )
                         ).all()
                         
-                        icao_list = [a[0] for a in airports_in_region if len(a[0]) == 4]
+                        icao_list = [a[0] for a in airports_in_region if len(a[0]) == 4 or len(a[0]) == 3]
                         
                         if icao_list:
                             airport_batches = [icao_list[i:i + 15] for i in range(0, len(icao_list), 15)]
