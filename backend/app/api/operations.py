@@ -17,6 +17,10 @@ ENDPOINTS:
   GET    /api/v1/operations/{id}/results/export    ← CSV of ready results
 
 NOTE: /credit-rates MUST appear before /{id} to avoid path collision.
+
+UPGRADES:
+  - N+1 Query Elimination in CSV Export: Added joinedload to prevent database
+    timeouts when exporting large datasets.
 """
 import io
 import csv
@@ -25,7 +29,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
 from app.crud.operations import (
@@ -476,7 +480,7 @@ def export_results(
             "country_code": operator.country_code or "",
         })
 
-    # ── ADDED FIX: Flight Tracks ──────────────────────────────────────────
+    # ── Flight Tracks ─────────────────────────────────────────────────────
     elif op.capability_type == "flight_tracks":
         from app.models import TrackTelemetry
 
@@ -513,8 +517,15 @@ def export_results(
 
     # ── Flight Summaries / Live / Historic ────────────────────────────────
     else:
+        # FIX ADDED HERE: joinedload prevents N+1 queries during CSV generation
         sessions = (
             db.query(FactFlightSession)
+            .options(
+                joinedload(FactFlightSession.aircraft),
+                joinedload(FactFlightSession.operator),
+                joinedload(FactFlightSession.dep_airport),
+                joinedload(FactFlightSession.arr_airport),
+            )
             .filter(FactFlightSession.operation_id == operation_id)
             .order_by(FactFlightSession.first_seen_ts.asc())
             .all()
