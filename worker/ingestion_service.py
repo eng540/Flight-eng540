@@ -1,34 +1,16 @@
 """
-Enterprise Ingestion Service (v6.2 — TIER 1 Fixed + Strict OpenAPI Compliance)
-Strictly compliant with FR24 OpenAPI v1 Specification.
+Enterprise Ingestion Service (v7.0 — Multi-Source Hybrid Engine)
+Strictly compliant with FR24 OpenAPI v1, OpenSky Network, and AirLabs v9.
 
-FIXES FROM v5.0:
-  [FIX-1] fr24_id: now extracted from f.get("fr24_id")
-           Evidence: FR24 OpenAPI FlightPositionsFull.fr24_id
-  [FIX-2] flight_number: extracted from f.get("flight") (commercial number)
-           Evidence: FR24 OpenAPI FlightPositionsFull.flight
-  [FIX-3] vspeed_fpm: extracted from f.get("vspeed") (ft/min native)
-           Evidence: FR24 OpenAPI FlightPositionsFull.vspeed
-  [FIX-4] aircraft_type: extracted from f.get("type")
-           Evidence: FR24 OpenAPI FlightPositionsFull.type
-  [FIX-5] on_ground: (alt_ft < 100) AND (gspeed < 30) — was: alt_ft == 0
-           Evidence: Business requirement; FR24 alt=0 only at gate, not taxi
-  [FIX-6] operator_icao = f.get("operating_as") ONLY — removed painted_as
-           Evidence: Business requirement "Use operating_as ONLY"
-  [FIX-7] Removed hashlib.md5 — fr24_id is now the stable dedup key
-           Evidence: Business requirement "Remove unused hashlib.md5"
-  [FIX-8] cleanup_old_data(): now performs real DB deletion with 30-day window
-           Evidence: Business requirement "implement cleanup_old_data (30-day retention)"
-  [NEW-1] ingest_date_range_for_region(): uses /api/historic/flight-positions/full
-           Evidence: called by tasks.py → AttributeError without it[NEW-2] enrich_flight_details(): uses /api/flight-summary/full
-           Evidence: Business requirement "implement enrich_flight_details"
-  [NEW-3] fetch_historical_track(): uses /api/flight-tracks
-           Evidence: Business requirement "implement fetch_historical_track"[FIX-9] settings.FR24_API_KEY via Settings — removed os.getenv()
-           Evidence: P0.3 fix; silent failure when key is absent
-
-NEW FIXES FOR v6.2 (OPENAPI AUDIT):[P0-V2] enrich_flight_details: parameter changed from flight_id to flight_ids (plural)
-  [P0-V3] enrich_flight_details: chunk_size strictly limited to 15 (API max limit)
-  [API-QUIRK] _safe_request: Added Array-to-Dict shield for endpoints like /api/flight-tracks returning lists.
+UPGRADES:
+  [NEW] ingest_live_radar_from_opensky: Primary free source (1 min interval).
+        Uses OpenSkyClient with curl fallback to bypass Cloud IP blocks.
+  [NEW] ingest_live_radar_from_airlabs: Secondary free source (1 hour interval).
+        Provides highly accurate routing data.
+  [UPDATED] FR24 Ingestion: Now tags payloads with data_source="FR24".
+  
+All sources map to a unified `RawIngestionPayload` and are routed through
+`EnterpriseDataRouter` which inherently deduplicates based on `icao24`.
 """
 import logging
 import sys
@@ -46,25 +28,18 @@ from app.crud import EnterpriseDataRouter
 
 logger = logging.getLogger(__name__)
 
-# Hours per historic chunk — limits each API call to one-hour window.
-# FR24 historic endpoint accepts a single `timestamp` (not a range),
-# so we query the midpoint of each hour-sized chunk.
 _HISTORIC_CHUNK_HOURS = 1
-
-# FR24 historic endpoint: one snapshot per timestamp.
-# We step through the range every N seconds to get coverage.
-_HISTORIC_STEP_SECONDS = 3600  # 1 snapshot/hour is enough for analytics
+_HISTORIC_STEP_SECONDS = 3600
 
 
 class FlightIngestionService:
 
     def __init__(self):
         self._db = None
-        # FIX-9: Use settings instead of os.getenv() — consistent with P0.3
         self.fr24_api_key = settings.FR24_API_KEY
         self.fr24_base_url = settings.FR24_BASE_URL
 
-        # SRE: Circuit Breaker state
+        # SRE: Circuit Breaker state for FR24
         self.consecutive_failures = 0
         self.pause_until = 0.0
 
@@ -83,15 +58,10 @@ class FlightIngestionService:
         return SessionLocal()
 
     # ─────────────────────────────────────────────────────────────────────────
-    # SRE: Resilient HTTP layer + Circuit Breaker
+    # SRE: Resilient HTTP layer + Circuit Breaker (FR24)
     # ─────────────────────────────────────────────────────────────────────────
 
     def _safe_request(self, endpoint: str, params: dict) -> Optional[dict]:
-        """
-        SRE: Resilient HTTP requester — FR24 OpenAPI spec compliant.
-        Handles 429 / 401 / 402 with appropriate backpressure.
-        Includes Array-to-Dict shield for endpoints returning lists instead of dicts.
-        """
         if not self.fr24_api_key:
             logger.error("[FR24 Auth] FR24_API_KEY is not set in settings.")
             return None
@@ -114,13 +84,8 @@ class FlightIngestionService:
             if response.status_code == 200:
                 self.consecutive_failures = 0
                 data = response.json()
-                
-                # 🛡️ Array-to-Dict Shield: 
-                # If the API (like /api/flight-tracks) incorrectly returns a list at the root,
-                # wrap it to prevent AttributeError down the line.
                 if isinstance(data, list):
                     return data[0] if len(data) > 0 else {}
-                
                 return data
 
             if response.status_code == 429:
@@ -128,8 +93,8 @@ class FlightIngestionService:
                 time.sleep(15)
                 return None
 
-            if response.status_code == 401:
-                logger.error("[FR24] 401 Unauthorized — invalid token. Pausing 10 min.")
+            if response.status_code in (401, 403):
+                logger.error(f"[FR24] {response.status_code} Unauthorized. Pausing 10 min.")
                 self.pause_until = time.time() + 600
                 return None
 
@@ -141,51 +106,186 @@ class FlightIngestionService:
             logger.error(f"[FR24] HTTP {response.status_code}: {response.text[:200]}")
             self.consecutive_failures += 1
             if self.consecutive_failures >= 3:
-                logger.error("[Circuit Breaker] 3 consecutive errors. Pausing 2 min.")
                 self.pause_until = time.time() + 120
             return None
 
-        except requests.exceptions.Timeout:
-            logger.error(f"[FR24] Request timed out: {url}")
-            self.consecutive_failures += 1
-            return None
         except requests.exceptions.RequestException as exc:
             logger.error(f"[FR24 Network] {exc}")
             return None
 
     # ─────────────────────────────────────────────────────────────────────────
-    # LIVE INGESTION — /api/live/flight-positions/full
+    # SOURCE 1: OPENSKY NETWORK (Primary Free Source - High Frequency)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def ingest_live_radar_from_opensky(self, regions) -> Dict[str, int]:
+        """
+        Fetches live state vectors from OpenSky.
+        Uses OpenSkyClient to bypass Cloud IP blocks via curl fallback.
+        """
+        from worker.opensky_client import OpenSkyClient
+        client = OpenSkyClient()
+        db = self._new_db()
+        now_ts = int(time.time())
+        totals = {"new_aircrafts": 0, "new_sessions": 0, "tracks_recorded": 0, "events": 0, "rejected": 0, "errors": 0}
+
+        if client.circuit_is_open:
+            logger.warning("[OpenSky] Circuit is OPEN. Skipping ingestion to prevent ban.")
+            return totals
+
+        try:
+            for region in regions:
+                logger.info(f"[OpenSky] Scanning {region.name_ar} ({region.key})")
+                raw_data = client.get_state_vectors(
+                    lamin=region.lamin, lomin=region.lomin,
+                    lamax=region.lamax, lomax=region.lomax
+                )
+                
+                if not raw_data or "states" not in raw_data or not raw_data["states"]:
+                    logger.info(f"[OpenSky] [{region.key}] No data or blocked.")
+                    continue
+
+                payloads = []
+                for state in raw_data["states"]:
+                    # OpenSky format: [icao24, callsign, origin_country, time_position, last_contact, lon, lat, baro_alt, on_ground, vel, true_track, vertical_rate, sensors, geo_alt, squawk, spi, position_source]
+                    if not state[0] or state[5] is None or state[6] is None:
+                        continue 
+                    
+                    alt_m = float(state[7]) if state[7] is not None else 0.0
+                    vel_kmh = float(state[9]) * 3.6 if state[9] is not None else 0.0
+                    vspeed_fpm = float(state[11]) * 196.85 if state[11] is not None else None
+                    
+                    payload = RawIngestionPayload(
+                        icao24=str(state[0]).lower()[:6],
+                        callsign=str(state[1]).strip() if state[1] else None,
+                        origin_country=state[2],
+                        timestamp=state[3] or state[4] or now_ts,
+                        longitude=float(state[5]),
+                        latitude=float(state[6]),
+                        altitude=alt_m,
+                        velocity=vel_kmh,
+                        heading=float(state[10]) if state[10] is not None else None,
+                        vspeed_fpm=vspeed_fpm,
+                        on_ground=bool(state[8]),
+                        squawk=state[14],
+                        data_source="OPENSKY",
+                        region_key=region.key
+                    )
+                    payloads.append(payload)
+
+                if payloads:
+                    batch = EnterpriseDataRouter.process_telemetry_batch(db, payloads)
+                    for k in totals: totals[k] += batch.get(k, 0)
+                    logger.info(f"[OpenSky] [{region.key}] Processed {len(payloads)} flights. Stats: {batch}")
+                    
+                time.sleep(settings.INGESTION_DELAY_SECONDS)
+        except Exception as exc:
+            logger.error(f"[OpenSky] Error: {exc}", exc_info=True)
+            totals["errors"] += 1
+        finally:
+            db.close()
+            
+        return totals
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SOURCE 2: AIRLABS (Secondary Free Source - Low Frequency)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def ingest_live_radar_from_airlabs(self, regions) -> Dict[str, int]:
+        """
+        Fetches live flights from AirLabs.
+        Provides highly accurate routing (dep_icao, arr_icao).
+        """
+        api_key = os.getenv("AIRLABS_API_KEY")
+        if not api_key:
+            logger.warning("[AirLabs] AIRLABS_API_KEY not set in environment. Skipping.")
+            return {}
+
+        db = self._new_db()
+        now_ts = int(time.time())
+        totals = {"new_aircrafts": 0, "new_sessions": 0, "tracks_recorded": 0, "events": 0, "rejected": 0, "errors": 0}
+
+        try:
+            for region in regions:
+                logger.info(f"[AirLabs] Scanning {region.name_ar} ({region.key})")
+                bbox = f"{region.lamin},{region.lomin},{region.lamax},{region.lomax}"
+                url = f"https://airlabs.co/api/v9/flights?api_key={api_key}&bbox={bbox}"
+                
+                resp = requests.get(url, timeout=15)
+                if resp.status_code != 200:
+                    logger.error(f"[AirLabs] HTTP {resp.status_code}: {resp.text}")
+                    continue
+                    
+                data = resp.json()
+                flights = data.get("response", [])
+                if not flights:
+                    logger.info(f"[AirLabs] [{region.key}] No data.")
+                    continue
+
+                payloads = []
+                for f in flights:
+                    icao24 = f.get("hex")
+                    if not icao24 or f.get("lat") is None or f.get("lng") is None:
+                        continue
+                        
+                    payload = RawIngestionPayload(
+                        icao24=str(icao24).lower()[:6],
+                        callsign=f.get("flight_iata") or f.get("flight_icao") or f.get("reg_number"),
+                        flight_number=f.get("flight_number"),
+                        registration=f.get("reg_number"),
+                        operator_icao=f.get("airline_icao"),
+                        origin_country=f.get("flag"),
+                        timestamp=now_ts,
+                        longitude=float(f.get("lng")),
+                        latitude=float(f.get("lat")),
+                        altitude=float(f.get("alt", 0)),
+                        velocity=float(f.get("speed", 0)),
+                        heading=float(f.get("dir")) if f.get("dir") is not None else None,
+                        vspeed_fpm=float(f.get("v_speed", 0)) * 196.85 if f.get("v_speed") is not None else None,
+                        on_ground=bool(f.get("alt", 1000) == 0),
+                        est_departure_airport=f.get("dep_icao"),
+                        est_arrival_airport=f.get("arr_icao"),
+                        squawk=f.get("squawk"),
+                        data_source="AIRLABS",
+                        region_key=region.key
+                    )
+                    payloads.append(payload)
+
+                if payloads:
+                    batch = EnterpriseDataRouter.process_telemetry_batch(db, payloads)
+                    for k in totals: totals[k] += batch.get(k, 0)
+                    logger.info(f"[AirLabs] [{region.key}] Processed {len(payloads)} flights. Stats: {batch}")
+                    
+                time.sleep(2) # AirLabs rate limit protection
+        except Exception as exc:
+            logger.error(f"[AirLabs] Error: {exc}", exc_info=True)
+            totals["errors"] += 1
+        finally:
+            db.close()
+            
+        return totals
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SOURCE 3: FLIGHTRADAR24 (Fallback/Premium Source)
     # ─────────────────────────────────────────────────────────────────────────
 
     def ingest_live_radar_from_fr24(self, regions) -> Dict[str, int]:
         """
         Sweep all configured regions via FR24 live positions.
-        One API call per region → batch-processed via EnterpriseDataRouter.
         """
-        totals = {
-            "new_aircrafts": 0, "new_sessions": 0,
-            "tracks_recorded": 0, "events": 0,
-            "rejected": 0, "errors": 0,
-        }
+        totals = {"new_aircrafts": 0, "new_sessions": 0, "tracks_recorded": 0, "events": 0, "rejected": 0, "errors": 0}
         db = self._new_db()
         now_ts = int(time.time())
 
         try:
             for region in regions:
-                logger.info(f"[Live] Scanning {region.name_ar} ({region.key})")
-
-                # FR24 bounds format: "lamax,lamin,lomin,lomax"
+                logger.info(f"[FR24] Scanning {region.name_ar} ({region.key})")
                 bounds = f"{region.lamax},{region.lamin},{region.lomin},{region.lomax}"
-                data = self._safe_request(
-                    "/api/live/flight-positions/full",
-                    {"bounds": bounds, "limit": 1500},
-                )
+                data = self._safe_request("/api/live/flight-positions/full", {"bounds": bounds, "limit": 1500})
                 if not data:
                     continue
 
                 flights = data.get("data",[])
                 if not flights:
-                    logger.info(f"[{region.key}] Empty airspace.")
                     continue
 
                 payloads =[]
@@ -196,14 +296,11 @@ class FlightIngestionService:
 
                 if payloads:
                     batch = EnterpriseDataRouter.process_telemetry_batch(db, payloads)
-                    for k in totals:
-                        totals[k] += batch.get(k, 0)
-                    logger.info(
-                        f"[{region.key}] Processed {len(payloads)} flights. Stats: {batch}"
-                    )
+                    for k in totals: totals[k] += batch.get(k, 0)
+                    logger.info(f"[FR24] [{region.key}] Processed {len(payloads)} flights. Stats: {batch}")
 
         except Exception as exc:
-            logger.error(f"[Live Radar] Critical error: {exc}", exc_info=True)
+            logger.error(f"[FR24] Critical error: {exc}", exc_info=True)
             totals["errors"] += 1
         finally:
             db.close()
@@ -211,37 +308,16 @@ class FlightIngestionService:
         return totals
 
     # ─────────────────────────────────────────────────────────────────────────
-    # HISTORIC INGESTION — /api/historic/flight-positions/full
+    # HISTORIC INGESTION (FR24)
     # ─────────────────────────────────────────────────────────────────────────
 
-    def ingest_date_range_for_region(
-        self,
-        begin_ts: int,
-        end_ts: int,
-        region,
-        force_reingest: bool = False,
-    ) -> Dict[str, int]:
-        """[NEW-1] Ingest historic flight positions for a Unix timestamp range and region.
-
-        Strategy: Step through[begin_ts, end_ts] in _HISTORIC_STEP_SECONDS increments.
-        Each step calls /api/historic/flight-positions/full with:
-          - timestamp: Unix epoch of the snapshot
-          - bounds: region bounding box (lamax,lamin,lomin,lomax)
-
-        Each (date_str × region_key) is tracked as an IngestionJob for idempotency.
-        """
+    def ingest_date_range_for_region(self, begin_ts: int, end_ts: int, region, force_reingest: bool = False) -> Dict[str, int]:
         from app.database import SessionLocal
         from app.models import IngestionJob
         from sqlalchemy import and_
 
         db = SessionLocal()
-        totals = {
-            "jobs_processed": 0,
-            "jobs_skipped": 0,
-            "flights_created": 0,
-            "flights_updated": 0,
-        }
-
+        totals = {"jobs_processed": 0, "jobs_skipped": 0, "flights_created": 0, "flights_updated": 0}
         bounds = f"{region.lamax},{region.lamin},{region.lomin},{region.lomax}"
         current_ts = begin_ts
 
@@ -249,50 +325,16 @@ class FlightIngestionService:
             while current_ts <= end_ts:
                 date_str = datetime.utcfromtimestamp(current_ts).strftime("%Y-%m-%d")
 
-                # Idempotency check — skip completed jobs unless forced
                 if not force_reingest:
-                    existing = (
-                        db.query(IngestionJob)
-                        .filter(
-                            and_(
-                                IngestionJob.region_key == region.key,
-                                IngestionJob.date_str == date_str,
-                                IngestionJob.status == "completed",
-                            )
-                        )
-                        .first()
-                    )
+                    existing = db.query(IngestionJob).filter(and_(IngestionJob.region_key == region.key, IngestionJob.date_str == date_str, IngestionJob.status == "completed")).first()
                     if existing:
-                        logger.debug(f"[Historic] Skip {date_str}/{region.key} (already done)")
                         totals["jobs_skipped"] += 1
                         current_ts += _HISTORIC_STEP_SECONDS
                         continue
 
-                # Create / update IngestionJob record
-                job = (
-                    db.query(IngestionJob)
-                    .filter(
-                        and_(
-                            IngestionJob.region_key == region.key,
-                            IngestionJob.date_str == date_str,
-                        )
-                    )
-                    .first()
-                )
+                job = db.query(IngestionJob).filter(and_(IngestionJob.region_key == region.key, IngestionJob.date_str == date_str)).first()
                 if not job:
-                    job = IngestionJob(
-                        job_type="historic",
-                        region_key=region.key,
-                        date_str=date_str,
-                        lamin=region.lamin,
-                        lomin=region.lomin,
-                        lamax=region.lamax,
-                        lomax=region.lomax,
-                        begin_ts=begin_ts,
-                        end_ts=end_ts,
-                        status="running",
-                        started_at=datetime.now(timezone.utc),
-                    )
+                    job = IngestionJob(job_type="historic", region_key=region.key, date_str=date_str, lamin=region.lamin, lomin=region.lomin, lamax=region.lamax, lomax=region.lomax, begin_ts=begin_ts, end_ts=end_ts, status="running", started_at=datetime.now(timezone.utc))
                     db.add(job)
                 else:
                     job.status = "running"
@@ -300,16 +342,11 @@ class FlightIngestionService:
                 db.commit()
                 db.refresh(job)
 
-                logger.info(f"[Historic] Fetching {date_str} @ {region.key} ts={current_ts}")
-
-                data = self._safe_request(
-                    "/api/historic/flight-positions/full",
-                    {"bounds": bounds, "timestamp": current_ts, "limit": 1500},
-                )
+                data = self._safe_request("/api/historic/flight-positions/full", {"bounds": bounds, "timestamp": current_ts, "limit": 1500})
 
                 if not data:
                     job.status = "failed"
-                    job.error_message = "API returned no data (circuit breaker or quota)"
+                    job.error_message = "API returned no data"
                     db.commit()
                     current_ts += _HISTORIC_STEP_SECONDS
                     continue
@@ -318,8 +355,7 @@ class FlightIngestionService:
                 payloads =[]
                 for f in flights:
                     payload = self._parse_fr24_position(f, current_ts, region.key)
-                    if payload:
-                        payloads.append(payload)
+                    if payload: payloads.append(payload)
 
                 ingested = 0
                 if payloads:
@@ -332,7 +368,6 @@ class FlightIngestionService:
                     finally:
                         ingest_db.close()
 
-                # Mark job done
                 job.status = "completed"
                 job.flights_ingested = (job.flights_ingested or 0) + ingested
                 job.records_processed = (job.records_processed or 0) + len(payloads)
@@ -340,12 +375,7 @@ class FlightIngestionService:
                 db.commit()
 
                 totals["jobs_processed"] += 1
-                logger.info(
-                    f"[Historic] {date_str}/{region.key} — {len(payloads)} positions ingested"
-                )
-
                 current_ts += _HISTORIC_STEP_SECONDS
-                # Polite delay between historic API calls
                 time.sleep(settings.INGESTION_DELAY_SECONDS)
 
         except Exception as exc:
@@ -356,145 +386,76 @@ class FlightIngestionService:
         return totals
 
     # ─────────────────────────────────────────────────────────────────────────
-    # ENRICHMENT — /api/flight-summary/full
+    # ENRICHMENT & TRACKS (FR24)
     # ─────────────────────────────────────────────────────────────────────────
 
     def enrich_flight_details(self, fr24_ids: List[str]) -> Dict[str, Any]:
-        """
-        [NEW-2] Fetch full flight summary for a list of fr24_ids.
-        Uses /api/flight-summary/full → FlightSummaryFull schema.
-        Updates FactFlightSession with departure/arrival/timing data.
-
-        Evidence: FR24 OpenAPI /api/flight-summary/full accepts
-        FlightIdsFlightSummary (comma-separated fr24_ids, max 15 IDs).
-        """
-        if not fr24_ids:
-            return {"enriched": 0, "errors": 0}
-
+        if not fr24_ids: return {"enriched": 0, "errors": 0}
         from app.database import SessionLocal
         from app.models import FactFlightSession, DimGeography
-        from sqlalchemy import and_
 
-        # P0-V3 FIX: FR24 accepts maximum 15 IDs per call for flight_ids
         chunk_size = 15
         enriched = 0
         errors = 0
-
         db = SessionLocal()
+        
         try:
             for i in range(0, len(fr24_ids), chunk_size):
                 chunk = fr24_ids[i : i + chunk_size]
-                ids_param = ",".join(chunk)
-
-                # P0-V2 FIX: Changed "flight_id" to "flight_ids"
-                data = self._safe_request(
-                    "/api/flight-summary/full",
-                    {"flight_ids": ids_param, "limit": len(chunk)},
-                )
+                data = self._safe_request("/api/flight-summary/full", {"flight_ids": ",".join(chunk), "limit": len(chunk)})
                 if not data:
                     errors += len(chunk)
                     continue
 
                 for summary in data.get("data",[]):
                     fr24_id = summary.get("fr24_id")
-                    if not fr24_id:
-                        continue
+                    if not fr24_id: continue
+                    session = db.query(FactFlightSession).filter(FactFlightSession.fr24_id == fr24_id).first()
+                    if not session: continue
 
-                    session = (
-                        db.query(FactFlightSession)
-                        .filter(FactFlightSession.fr24_id == fr24_id)
-                        .first()
-                    )
-                    if not session:
-                        continue
-
-                    # Enrich with summary data (FlightSummaryFull fields)
                     if summary.get("orig_icao"):
-                        dep = (
-                            db.query(DimGeography)
-                            .filter(DimGeography.icao_code == summary["orig_icao"])
-                            .first()
-                        )
-                        if dep:
-                            session.dep_airport_id = dep.id
+                        dep = db.query(DimGeography).filter(DimGeography.icao_code == summary["orig_icao"]).first()
+                        if dep: session.dep_airport_id = dep.id
 
                     if summary.get("dest_icao") or summary.get("dest_icao_actual"):
                         arr_icao = summary.get("dest_icao_actual") or summary.get("dest_icao")
-                        arr = (
-                            db.query(DimGeography)
-                            .filter(DimGeography.icao_code == arr_icao)
-                            .first()
-                        )
-                        if arr:
-                            session.arr_airport_id = arr.id
+                        arr = db.query(DimGeography).filter(DimGeography.icao_code == arr_icao).first()
+                        if arr: session.arr_airport_id = arr.id
 
-                    # Actual takeoff / landing timestamps
                     if summary.get("datetime_takeoff"):
-                        try:
-                            session.actual_takeoff_ts = datetime.fromisoformat(
-                                summary["datetime_takeoff"].replace("Z", "+00:00")
-                            )
-                        except (ValueError, AttributeError):
-                            pass
+                        try: session.actual_takeoff_ts = datetime.fromisoformat(summary["datetime_takeoff"].replace("Z", "+00:00"))
+                        except: pass
 
                     if summary.get("datetime_landed"):
-                        try:
-                            session.actual_landing_ts = datetime.fromisoformat(
-                                summary["datetime_landed"].replace("Z", "+00:00")
-                            )
-                        except (ValueError, AttributeError):
-                            pass
+                        try: session.actual_landing_ts = datetime.fromisoformat(summary["datetime_landed"].replace("Z", "+00:00"))
+                        except: pass
 
-                    if summary.get("actual_distance"):
-                        session.total_distance_km = float(summary["actual_distance"])
-
-                    if summary.get("flight_ended"):
-                        session.flight_status = "landed"
-
+                    if summary.get("actual_distance"): session.total_distance_km = float(summary["actual_distance"])
+                    if summary.get("flight_ended"): session.flight_status = "landed"
                     enriched += 1
 
                 db.commit()
-                time.sleep(1)  # polite delay between enrichment chunks
-
+                time.sleep(1)
         except Exception as exc:
             logger.error(f"[Enrich] Error: {exc}", exc_info=True)
             errors += 1
         finally:
             db.close()
 
-        logger.info(f"[Enrich] Enriched {enriched} sessions, errors={errors}")
         return {"enriched": enriched, "errors": errors}
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # TRACK FETCHING — /api/flight-tracks
-    # ─────────────────────────────────────────────────────────────────────────
-
     def fetch_historical_track(self, fr24_id: str) -> Optional[List[Dict]]:
-        """
-        [NEW-3] Fetch full trajectory for a given fr24_id.
-        Uses /api/flight-tracks → FlightTracks schema.
-
-        Evidence: FR24 OpenAPI /api/flight-tracks accepts query param flight_id.
-        Returns list of track points or None on failure.
-        """
         data = self._safe_request("/api/flight-tracks", {"flight_id": fr24_id})
-        if not data:
-            return None
-
-        # FR24 FlightTracks: {"fr24_id": ..., "tracks":[{timestamp, lat, lon, alt, gspeed, vspeed, track, ...}]}
+        if not data: return None
         tracks_raw = data.get("tracks",[])
-        if not tracks_raw:
-            return []
+        if not tracks_raw: return []
 
         result =[]
         for point in tracks_raw:
             ts_str = point.get("timestamp")
-            if not ts_str:
-                continue
-            try:
-                dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-            except (ValueError, AttributeError):
-                continue
+            if not ts_str: continue
+            try: dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            except: continue
 
             result.append({
                 "timestamp": dt,
@@ -505,32 +466,14 @@ class FlightIngestionService:
                 "vspeed_fpm": point.get("vspeed"),
                 "heading_deg": point.get("track"),
             })
-
-        logger.info(f"[Track] Fetched {len(result)} points for fr24_id={fr24_id}")
         return result
 
     # ─────────────────────────────────────────────────────────────────────────
-    # CLEANUP — 30-day data retention
+    # CLEANUP
     # ─────────────────────────────────────────────────────────────────────────
 
     def cleanup_old_data(self, days: int) -> int:
-        """
-        [FIX-8] Actual deletion of data older than `days`.
-        Previously was a no-op returning 0.
-        Evidence: Business requirement "implement cleanup_old_data (30-day retention)"
-
-        Deletes in dependency order:
-          TrackTelemetry → via CASCADE from FactFlightSession
-          FactFlightSession (old, landed sessions only)
-          CurrentAircraftState (stale entries — last_updated > 5 minutes)
-          IngestionJob (old completed jobs)
-
-        Returns: total rows deleted
-        """
-        if days <= 0:
-            logger.info("[Cleanup] days=0 — retention disabled, nothing deleted.")
-            return 0
-
+        if days <= 0: return 0
         from app.database import SessionLocal
         from app.models import FactFlightSession, CurrentAircraftState, IngestionJob
         from sqlalchemy import and_
@@ -543,133 +486,76 @@ class FlightIngestionService:
         deleted_total = 0
 
         try:
-            # 1. Delete old completed flight sessions (TrackTelemetry CASCADE)
-            old_sessions = (
-                db.query(FactFlightSession)
-                .filter(
-                    and_(
-                        FactFlightSession.last_seen_ts < cutoff,
-                        FactFlightSession.flight_status.in_(["landed", "completed"]),
-                    )
-                )
-                .all()
-            )
+            old_sessions = db.query(FactFlightSession).filter(and_(FactFlightSession.last_seen_ts < cutoff, FactFlightSession.flight_status.in_(["landed", "completed"]))).all()
             count = len(old_sessions)
-            for session in old_sessions:
-                db.delete(session)
+            for session in old_sessions: db.delete(session)
             db.flush()
-            logger.info(f"[Cleanup] Deleted {count} old flight sessions (+ cascaded tracks)")
             deleted_total += count
 
-            # 2. Remove stale live-state entries (aircraft not seen in 10 min)
-            stale = (
-                db.query(CurrentAircraftState)
-                .filter(CurrentAircraftState.last_updated < stale_state_cutoff)
-                .all()
-            )
+            stale = db.query(CurrentAircraftState).filter(CurrentAircraftState.last_updated < stale_state_cutoff).all()
             stale_count = len(stale)
-            for entry in stale:
-                db.delete(entry)
+            for entry in stale: db.delete(entry)
             db.flush()
-            logger.info(f"[Cleanup] Removed {stale_count} stale CurrentAircraftState entries")
             deleted_total += stale_count
 
-            # 3. Remove old completed ingestion job records
-            old_jobs = (
-                db.query(IngestionJob)
-                .filter(
-                    and_(
-                        IngestionJob.completed_at < job_cutoff,
-                        IngestionJob.status == "completed",
-                    )
-                )
-                .all()
-            )
+            old_jobs = db.query(IngestionJob).filter(and_(IngestionJob.completed_at < job_cutoff, IngestionJob.status == "completed")).all()
             job_count = len(old_jobs)
-            for job in old_jobs:
-                db.delete(job)
+            for job in old_jobs: db.delete(job)
             db.flush()
-            logger.info(f"[Cleanup] Purged {job_count} old IngestionJob records")
             deleted_total += job_count
 
             db.commit()
-            logger.info(f"[Cleanup] Total deleted: {deleted_total} rows (cutoff={cutoff.date()})")
-
         except Exception as exc:
             db.rollback()
-            logger.error(f"[Cleanup] Error during cleanup: {exc}", exc_info=True)
+            logger.error(f"[Cleanup] Error: {exc}", exc_info=True)
         finally:
             db.close()
 
         return deleted_total
 
     # ─────────────────────────────────────────────────────────────────────────
-    # INTERNAL: FR24 position parser (shared by live + historic)
+    # INTERNAL: FR24 position parser
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _parse_fr24_position(
-        self, f: dict, fallback_ts: int, region_key: str
-    ) -> Optional[RawIngestionPayload]:
-        """
-        Parse a single FR24 FlightPositionsFull dict into RawIngestionPayload.
-        All field names are exactly as specified in FR24 OpenAPI FlightPositionsFull.
-        Returns None if icao24 (hex) is missing — cannot track anonymous aircraft.
-        """
-        # FR24 field: hex = ICAO 24-bit transponder address
+    def _parse_fr24_position(self, f: dict, fallback_ts: int, region_key: str) -> Optional[RawIngestionPayload]:
         icao24 = f.get("hex")
-        if not icao24:
-            return None
+        if not icao24: return None
 
-        # ── Timestamp ────────────────────────────────────────────────────────
         ts_str = f.get("timestamp")
         try:
             dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
             flight_ts = int(dt.timestamp())
-        except (ValueError, AttributeError, TypeError):
+        except:
             flight_ts = fallback_ts
 
-        # ── Altitude & Speed (FR24 native units) ─────────────────────────────
-        alt_ft   = f.get("alt")    # feet AMSL
-        gspeed   = f.get("gspeed") # knots
-        vspeed   = f.get("vspeed") # ft/min (store as-is)
+        alt_ft   = f.get("alt")
+        gspeed   = f.get("gspeed")
+        vspeed   = f.get("vspeed")
 
-        # FIX-5: on_ground = (alt < 100 ft) AND (gspeed < 30 kts)
-        # Previously: True if alt_ft == 0 else False — wrong for taxi/approach
-        on_ground = (
-            alt_ft  is not None and alt_ft  < 100 and
-            gspeed  is not None and gspeed  < 30
-        )
+        on_ground = (alt_ft is not None and alt_ft < 100 and gspeed is not None and gspeed < 30)
 
-        # Convert to metric for storage
         altitude_m  = float(alt_ft)  * 0.3048 if alt_ft  is not None else None
         velocity_kmh = float(gspeed) * 1.852  if gspeed  is not None else None
 
-        # FIX-6: operating_as ONLY — no painted_as fallback
-        # Evidence: Business requirement "Use operating_as ONLY"
-        operator_icao = f.get("operating_as")
-
         return RawIngestionPayload(
             icao24=str(icao24).lower()[:6],
-            # FIX-1: fr24_id — FR24 OpenAPI FlightPositionsFull.fr24_id
             fr24_id=f.get("fr24_id"),
             callsign=f.get("callsign"),
-            # FIX-2: flight_number — FR24 OpenAPI FlightPositionsFull.flight
             flight_number=f.get("flight"),
             registration=f.get("reg"),
-            # FIX-4: aircraft_type — FR24 OpenAPI FlightPositionsFull.type
             aircraft_type=f.get("type"),
-            operator_icao=operator_icao,
+            operator_icao=f.get("operating_as"),
             timestamp=flight_ts,
             longitude=float(f.get("lon", 0)),
             latitude=float(f.get("lat", 0)),
             altitude=altitude_m or 0.0,
             velocity=velocity_kmh or 0.0,
             heading=float(f.get("track", 0)) if f.get("track") is not None else None,
-            # FIX-3: vspeed_fpm — FR24 OpenAPI FlightPositionsFull.vspeed (ft/min)
             vspeed_fpm=float(vspeed) if vspeed is not None else None,
             on_ground=on_ground,
             est_departure_airport=f.get("orig_icao"),
             est_arrival_airport=f.get("dest_icao"),
             squawk=f.get("squawk"),
+            data_source="FR24", # <--- TAGGED
             region_key=region_key,
         )
