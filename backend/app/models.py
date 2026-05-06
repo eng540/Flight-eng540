@@ -1,19 +1,11 @@
 """
-Enterprise Aviation Intelligence Models (v3.1 — TIER 0 Fixed)
+Enterprise Aviation Intelligence Models (v3.2 — TIER 0 Fixed)
 SQLAlchemy ORM representation of the Snowflake Schema.
 
-CHANGES FROM v3.0:
-  FactFlightSession   → +fr24_id, +flight_number
-                        Evidence: FR24 OpenAPI FlightPositionsFull.fr24_id / .flight
-  TrackTelemetry      → +vspeed_fpm (was vertical_rate_ms, wrong units)
-                        Evidence: FR24 OpenAPI FlightPositionsFull.vspeed (ft/min)
-  CurrentAircraftState→ +fr24_id, +flight_number, +aircraft_type, +region_key
-                        Evidence: needed for live map enrichment + region filtering
-  IngestionJob        → +date_str, +lamin, +lomin, +lamax, +lomax, +begin_ts,
-                        +end_ts, +flights_ingested, +chunks_total, +chunks_done,
-                        +created_at
-                        Evidence: IngestionJobResponse in schemas.py references
-                        all these fields → ValidationError crash without them.
+CHANGES FROM v3.1:
+  TrackTelemetry      → +operation_id, +chunk_id
+                        Evidence: Added in DB migration 003 but missing in ORM,
+                        causing 500 Internal Server Error during CSV export.
 """
 from sqlalchemy import (
     Column, Integer, String, Float, DateTime, ForeignKey,
@@ -109,16 +101,8 @@ class FactFlightSession(Base):
     operator_id  = Column(Integer,   ForeignKey("dim_operator.id"),  nullable=True,  index=True)
 
     # ── FR24 Primary Keys ─────────────────────────────────────────────────
-    # FIX: Added fr24_id — FR24 OpenAPI FlightPositionsFull.fr24_id
-    # "Unique identifier assigned by Flightradar24 to each flight leg"
-    # Required for /api/flight-tracks and /api/flight-summary lookups.
     fr24_id      = Column(String(20), nullable=True, index=True)
-
-    # FIX: Added flight_number — FR24 OpenAPI FlightPositionsFull.flight
-    # "Commercial flight number" — distinct from ATC callsign.
-    # Example: callsign="SVA461", flight_number="SV461"
     flight_number = Column(String(20), nullable=True, index=True)
-
     callsign     = Column(String(20), nullable=True, index=True)
 
     dep_airport_id = Column(Integer, ForeignKey("dim_geography.id"), nullable=True, index=True)
@@ -142,9 +126,6 @@ class FactFlightSession(Base):
                                cascade="all, delete-orphan")
 
     # Operations Board: links this session to the Operation that ingested it.
-    # Added in migration 003. Nullable: sessions ingested before Operations Board
-    # (direct worker runs) will have NULL here — that is correct and expected.
-    # Evidence: system design §6 "إضافة operation_id + chunk_id لكل صف"
     operation_id = Column(
         BigInteger,
         ForeignKey("operations.id"),
@@ -188,17 +169,15 @@ class TrackTelemetry(Base):
     velocity_kmh = Column(Float, nullable=True)
     heading_deg  = Column(Float, nullable=True)
 
-    # LEGACY column kept (was named vertical_rate_ms but unit was wrong).
-    # New column vspeed_fpm stores FR24 native value (ft/min).
     vertical_rate_ms = Column(Float, nullable=True)
-
-    # FIX: Added vspeed_fpm — FR24 OpenAPI FlightPositionsFull.vspeed
-    # "The rate at which the aircraft is ascending or descending in feet per minute"
-    # Stored as FR24 native unit (ft/min) to avoid double-conversion loss.
     vspeed_fpm = Column(Float, nullable=True)
 
     is_on_ground = Column(Boolean, default=False)
     squawk       = Column(String(4), nullable=True)
+
+    # ── FIX ADDED HERE: Operations Board Tagging ──────────────────────────
+    operation_id = Column(BigInteger, nullable=True)
+    chunk_id     = Column(BigInteger, nullable=True)
 
     session = relationship("FactFlightSession", back_populates="tracks")
 
@@ -239,27 +218,14 @@ class CurrentAircraftState(Base):
     icao24       = Column(String(6),   primary_key=True, nullable=False)
     aircraft_id  = Column(Integer,     nullable=True)
     session_id   = Column(BigInteger,  nullable=True)
-
-    # FIX: Added fr24_id for FR24 API enrichment lookups (flight-tracks, summary)
-    # Evidence: FR24 OpenAPI FlightPositionsFull.fr24_id
     fr24_id      = Column(String(20),  nullable=True)
-
     callsign     = Column(String(20),  nullable=True)
-
-    # FIX: Added flight_number — FR24 OpenAPI FlightPositionsFull.flight
     flight_number = Column(String(20), nullable=True)
-
     operator_name  = Column(String(255), nullable=True)
-
-    # FIX: Added aircraft_type — FR24 OpenAPI FlightPositionsFull.type
-    # "Aircraft ICAO type code" — needed for live map display
     aircraft_type  = Column(String(10),  nullable=True)
-
     aircraft_model = Column(String(100), nullable=True)
-
     dep_airport_iata = Column(String(4), nullable=True)
     arr_airport_iata = Column(String(4), nullable=True)
-
     latitude    = Column(Float,   nullable=True)
     longitude   = Column(Float,   nullable=True)
     altitude_m  = Column(Float,   nullable=True)
@@ -268,10 +234,7 @@ class CurrentAircraftState(Base):
     vspeed_fpm   = Column(Float,  nullable=True)
     on_ground    = Column(Boolean, nullable=True)
     squawk       = Column(String(4), nullable=True)
-
-    # FIX: Added region_key — stored so map can filter by region without a join
     region_key   = Column(String(50), nullable=True)
-
     last_updated = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __table_args__ = (
@@ -286,14 +249,7 @@ class CurrentAircraftState(Base):
 # ═════════════════════════════════════════════════════════════════════════════
 
 class IngestionJob(Base):
-    """
-    Tracks worker jobs and API budget usage.
-
-    FIX: Added all columns referenced in IngestionJobResponse schema.
-    Evidence: schemas.py IngestionJobResponse references date_str, lamin, lomin,
-    lamax, lomax, begin_ts, end_ts, flights_ingested, chunks_total, chunks_done
-    — none of which existed in the model → ValidationError on every API call.
-    """
+    """Tracks worker jobs and API budget usage."""
     __tablename__ = "ingestion_jobs"
 
     id         = Column(Integer, primary_key=True, index=True)
@@ -301,25 +257,18 @@ class IngestionJob(Base):
     region_key = Column(String(50), nullable=False)
     status     = Column(String(20), default="pending", nullable=False)
 
-    # NEW: Human-readable date string e.g. "2026-04-15"
     date_str   = Column(String(10), nullable=True)
-
-    # NEW: Bounding box stored so UI can display coverage
     lamin = Column(Float, nullable=True)
     lomin = Column(Float, nullable=True)
     lamax = Column(Float, nullable=True)
     lomax = Column(Float, nullable=True)
-
-    # NEW: Unix epoch range for the ingestion window
     begin_ts = Column(BigInteger, nullable=True)
     end_ts   = Column(BigInteger, nullable=True)
 
-    # NEW: Progress tracking
     flights_ingested = Column(Integer, default=0)
     chunks_total     = Column(Integer, default=0)
     chunks_done      = Column(Integer, default=0)
 
-    # LEGACY (kept for backward compat)
     target_date       = Column(Date,    nullable=True)
     records_processed = Column(Integer, default=0)
     api_calls         = Column(Integer, default=0)
@@ -342,13 +291,6 @@ class IngestionJob(Base):
 # ═════════════════════════════════════════════════════════════════════════════
 
 class ApiCreditRate(Base):
-    """
-    Updatable credit cost table per FR24 capability type.
-    Evidence: system design §4 Pre-flight Engine:
-    "api_credit_rates (DB table — updatable)"
-    Seeded in migration 003. Updated by admin or automatically from
-    observed actual credits_used per call.
-    """
     __tablename__ = "api_credit_rates"
 
     id               = Column(Integer, primary_key=True)
@@ -363,20 +305,10 @@ class ApiCreditRate(Base):
 
 
 class Operation(Base):
-    """
-    User-intent entity: "I want to know X about Y during Z."
-    One Operation → N OperationChunks → N FR24 API calls.
-
-    Evidence: system design §1 — full schema.
-    State machine: pending → planned → running → partial → completed
-                                                          → failed
-                                                          → cancelled
-    """
     __tablename__ = "operations"
 
     id            = Column(BigInteger, primary_key=True, autoincrement=True)
     operation_ref = Column(String(20), nullable=False, unique=True)
-
     capability_type = Column(String(50), nullable=False)
 
     scope_region_key    = Column(String(50), nullable=True)
@@ -452,11 +384,6 @@ class Operation(Base):
 
 
 class OperationChunk(Base):
-    """
-    Execution unit: exactly one FR24 API call.
-    Evidence: system design §2 Chunk Model.
-    State: pending → running → completed | failed | cancelled | skipped
-    """
     __tablename__ = "operation_chunks"
 
     id           = Column(BigInteger, primary_key=True, autoincrement=True)
@@ -475,7 +402,6 @@ class OperationChunk(Base):
 
     region_key = Column(String(50), nullable=True)
     bounds     = Column(JSONB,      nullable=True)
-
     entity_id = Column(String(100), nullable=True)
 
     fr24_endpoint = Column(String(200), nullable=True)
@@ -499,7 +425,6 @@ class OperationChunk(Base):
     last_error  = Column(Text,    nullable=True)
     http_status = Column(Integer, nullable=True)
 
-    # Key: "op:{operation_id}:chunk:{chunk_id}"
     partial_result_key = Column(String(200), nullable=True)
 
     operation = relationship("Operation", back_populates="chunks")
