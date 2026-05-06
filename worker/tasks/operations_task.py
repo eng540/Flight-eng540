@@ -1,3 +1,4 @@
+#--- START OF FILE Flight-eng540-eng540-patch-1/worker/tasks/operations_task.py ---
 """
 Operations Board Celery Task (System Design §5–§7)
 
@@ -10,11 +11,14 @@ INCLUDES FIXES:
   - Zero-Chunk Paralysis fixed (Operations with 0 chunks mark as completed immediately).
   - Infinite Retry fixed (Do not retry chunks on HTTP 400/401/403/404/422).
   - CSV Export fix (Tag flight sessions using their exact fr24_id).
+  - RADICAL EXPORT FIX: Aggressive tagging for flight_summaries and flight_tracks
+    to ensure all fetched data is linked to operation_id and chunk_id.
 """
 import logging
 import time
 import sys
 import os
+from datetime import datetime, timezone
 
 from celery import shared_task
 from celery.exceptions import MaxRetriesExceededError, SoftTimeLimitExceeded
@@ -284,7 +288,7 @@ def _parse_and_store(db, response: dict, chunk, op) -> int:
 
     # Different response structures per capability type
     if cap in ("live_positions", "historic_positions"):
-        items = response.get("data", [])
+        items = response.get("data",[])
         payloads =[]
         for item in items:
             payload = svc._parse_fr24_position(
@@ -302,11 +306,10 @@ def _parse_and_store(db, response: dict, chunk, op) -> int:
         return len(payloads)
 
     elif cap == "flight_summaries":
-        # FlightSummaryFull — enrich sessions via enrich_flight_details
+        # RADICAL FIX: Use dedicated store function to upsert and tag summaries
         items = response.get("data",[])
-        fr24_ids =[i.get("fr24_id") for i in items if i.get("fr24_id")]
-        if fr24_ids:
-            svc.enrich_flight_details(fr24_ids)
+        if items:
+            _store_summaries(db, items, op.id, chunk.id)
         return len(items)
 
     elif cap == "flight_tracks":
@@ -332,6 +335,8 @@ def _parse_and_store(db, response: dict, chunk, op) -> int:
 def _store_with_operation_tag(db, payloads, operation_id: int, chunk_id: int):
     """
     Processes telemetry batch and tags the resulting sessions with operation/chunk IDs.
+    RADICAL FIX: Removed `.is_(None)` condition. If a flight is fetched, it MUST
+    be tagged with the current operation_id so it appears in the CSV export.
     """
     from app.crud import EnterpriseDataRouter
     from app.models import FactFlightSession
@@ -345,18 +350,123 @@ def _store_with_operation_tag(db, payloads, operation_id: int, chunk_id: int):
     # 3. Tag these specific flights so they appear in CSV Exports!
     if fr24_ids:
         db.query(FactFlightSession).filter(
-            FactFlightSession.fr24_id.in_(fr24_ids),
-            FactFlightSession.operation_id.is_(None)
+            FactFlightSession.fr24_id.in_(fr24_ids)
         ).update(
             {"operation_id": operation_id, "chunk_id": chunk_id},
             synchronize_session=False,
         )
 
 
+def _store_summaries(db, items: list, operation_id: int, chunk_id: int):
+    """
+    RADICAL FIX: Dedicated function to parse, upsert, and aggressively TAG 
+    flight summaries with operation_id and chunk_id.
+    """
+    from app.models import FactFlightSession, DimGeography, DimOperator, DimAircraft
+
+    for summary in items:
+        fr24_id = summary.get("fr24_id")
+        if not fr24_id:
+            continue
+
+        # 1. Resolve or Create Aircraft (Required by FactFlightSession)
+        hex_code = summary.get("hex")
+        if not hex_code:
+            hex_code = f"unk_{fr24_id}"[:6].lower()
+        else:
+            hex_code = hex_code.lower()
+            
+        ac = db.query(DimAircraft).filter(DimAircraft.icao24 == hex_code).first()
+        if not ac:
+            ac = DimAircraft(
+                icao24=hex_code,
+                registration=summary.get("reg"),
+                type_code=summary.get("equip")
+            )
+            db.add(ac)
+            db.flush()
+
+        # 2. Resolve or Create Operator
+        op_id = None
+        op_icao = summary.get("operating_as")
+        if op_icao:
+            operator = db.query(DimOperator).filter(DimOperator.icao_code == op_icao.upper()).first()
+            if not operator:
+                operator = DimOperator(icao_code=op_icao.upper(), name=f"Operator {op_icao}")
+                db.add(operator)
+                db.flush()
+            op_id = operator.id
+
+        # 3. Resolve Airports
+        dep_id = None
+        if summary.get("orig_icao"):
+            dep_icao = summary["orig_icao"].upper()
+            dep = db.query(DimGeography).filter(DimGeography.icao_code == dep_icao).first()
+            if not dep:
+                dep = DimGeography(icao_code=dep_icao, name=f"Airport {dep_icao}")
+                db.add(dep)
+                db.flush()
+            dep_id = dep.id
+
+        arr_id = None
+        arr_icao_raw = summary.get("dest_icao_actual") or summary.get("dest_icao")
+        if arr_icao_raw:
+            arr_icao = arr_icao_raw.upper()
+            arr = db.query(DimGeography).filter(DimGeography.icao_code == arr_icao).first()
+            if not arr:
+                arr = DimGeography(icao_code=arr_icao, name=f"Airport {arr_icao}")
+                db.add(arr)
+                db.flush()
+            arr_id = arr.id
+
+        # 4. Timestamps
+        now = _now()
+        t_takeoff = now
+        t_landed = now
+        if summary.get("datetime_takeoff"):
+            try:
+                t_takeoff = datetime.fromisoformat(summary["datetime_takeoff"].replace("Z", "+00:00"))
+            except: pass
+        if summary.get("datetime_landed"):
+            try:
+                t_landed = datetime.fromisoformat(summary["datetime_landed"].replace("Z", "+00:00"))
+            except: pass
+
+        # 5. Upsert Session
+        session = db.query(FactFlightSession).filter(FactFlightSession.fr24_id == fr24_id).first()
+        if not session:
+            session = FactFlightSession(
+                aircraft_id=ac.id,
+                fr24_id=fr24_id,
+                first_seen_ts=t_takeoff,
+                last_seen_ts=t_landed,
+            )
+            db.add(session)
+
+        # Update fields & TAG the operation
+        session.operation_id = operation_id
+        session.chunk_id = chunk_id
+        session.operator_id = op_id
+        session.dep_airport_id = dep_id
+        session.arr_airport_id = arr_id
+        
+        if summary.get("flight"): session.flight_number = summary.get("flight")
+        if summary.get("callsign"): session.callsign = summary.get("callsign")
+        if summary.get("actual_distance"): session.total_distance_km = float(summary.get("actual_distance"))
+        
+        session.flight_status = "landed" if summary.get("flight_ended") else "active"
+        session.actual_takeoff_ts = t_takeoff if summary.get("datetime_takeoff") else None
+        session.actual_landing_ts = t_landed if summary.get("datetime_landed") else None
+
+    db.flush()
+
+
 def _store_tracks(db, tracks: list, fr24_id: str, operation_id: int, chunk_id: int):
-    """Stores flight track points in track_telemetry."""
+    """
+    Stores flight track points in track_telemetry.
+    RADICAL FIX: Tags TrackTelemetry rows with operation_id and chunk_id.
+    """
     from app.models import FactFlightSession, TrackTelemetry
-    from datetime import datetime, timezone
 
     session = (
         db.query(FactFlightSession)
@@ -382,7 +492,10 @@ def _store_tracks(db, tracks: list, fr24_id: str, operation_id: int, chunk_id: i
             TrackTelemetry.timestamp == dt,
         ).first()
         if track:
-            continue   # already stored
+            # Update tag even if it exists
+            track.operation_id = operation_id
+            track.chunk_id = chunk_id
+            continue
 
         db.add(TrackTelemetry(
             timestamp=dt,
@@ -394,6 +507,8 @@ def _store_tracks(db, tracks: list, fr24_id: str, operation_id: int, chunk_id: i
             heading_deg=point.get("track"),
             vspeed_fpm=point.get("vspeed"),
             is_on_ground=False,
+            operation_id=operation_id,  # <--- TAGGED
+            chunk_id=chunk_id,          # <--- TAGGED
         ))
 
 
@@ -468,10 +583,9 @@ def _extract_credits(response: dict) -> int:
 
 
 def _now():
-    from datetime import datetime, timezone
     return datetime.now(timezone.utc)
 
 
 def _now_ts() -> int:
-    import time
     return int(time.time())
+#--- END OF FILE ---
