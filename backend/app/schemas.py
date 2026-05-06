@@ -6,6 +6,7 @@ CHANGES FROM v3.1:
   RawIngestionPayload     → +data_source
   LivePositionResponse    → +data_source
                             Evidence: Support for OpenSky, AirLabs, and FR24.
+  HistoryQueryResponse    → uses FlightSearchItem for performance
 """
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional, List, Any, Dict
@@ -69,7 +70,7 @@ class TrackTelemetryBase(BaseModel):
     vspeed_fpm:   Optional[float] = None
     is_on_ground: Optional[bool]  = False
     squawk:       Optional[str]   = None
-    data_source:  Optional[str]   = None
+    data_source:  Optional[str]   = None   # NEW in v3.2
 
 class TrackTelemetryResponse(TrackTelemetryBase):
     model_config = ConfigDict(from_attributes=True)
@@ -129,7 +130,7 @@ class LivePositionResponse(BaseModel):
     region_key:    Optional[str]   = None
     last_updated:  Optional[datetime] = None
     session_id:    Optional[int]   = None
-    data_source:   Optional[str]   = None
+    data_source:   Optional[str]   = None   # NEW in v3.2
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -144,7 +145,7 @@ class TrajectoryPoint(BaseModel):
     vel: Optional[float] = None
     hdg: Optional[float] = None
     vspd: Optional[float] = None
-    src: Optional[str] = None
+    src: Optional[str] = None   # NEW in v3.2 (data source per point)
 
 class TrajectoryResponse(BaseModel):
     session_id: int
@@ -177,6 +178,48 @@ class FlightDetailResponse(BaseModel):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# 4.5 FLIGHT SEARCH ITEM (Lightweight for history queries)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class FlightSearchItem(BaseModel):
+    """
+    Lightweight version of FlightSessionResponse for history queries.
+    Does NOT include tracks to improve performance.
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    session_id: int
+    fr24_id: Optional[str] = None
+    flight_number: Optional[str] = None
+    callsign: Optional[str] = None
+    flight_status: Optional[str] = None
+    first_seen_ts: datetime
+    last_seen_ts: datetime
+
+    # Simplified airport info
+    dep_airport_icao: Optional[str] = None
+    dep_airport_iata: Optional[str] = None
+    dep_airport_name: Optional[str] = None
+    arr_airport_icao: Optional[str] = None
+    arr_airport_iata: Optional[str] = None
+    arr_airport_name: Optional[str] = None
+
+    # Simplified aircraft info
+    aircraft_icao24: Optional[str] = None
+    aircraft_type: Optional[str] = None
+    aircraft_model: Optional[str] = None
+
+    # Operator info
+    operator_icao: Optional[str] = None
+    operator_name: Optional[str] = None
+
+    # Flight statistics
+    max_altitude_m: Optional[float] = None
+    total_distance_km: Optional[float] = None
+    duration_seconds: Optional[int] = None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # 5. INGESTION (Internal Use + API)
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -202,7 +245,7 @@ class RawIngestionPayload(BaseModel):
     est_arrival_airport:   Optional[str] = None
     region_key:    Optional[str]   = "global"
     squawk:        Optional[str]   = None
-    data_source:   Optional[str]   = None
+    data_source:   Optional[str]   = None   # NEW in v3.2
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -306,7 +349,7 @@ class HistoryQueryResponse(BaseModel):
     page:         int
     page_size:    int
     pages:        int
-    data:         List[FlightSearchItem]
+    data:         List[FlightSearchItem]   # ✅ Fixed: uses FlightSearchItem
     aggregations: Optional[HistoryAggregations] = None
 
 
