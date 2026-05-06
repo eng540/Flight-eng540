@@ -1,3 +1,4 @@
+#--- START OF FILE Flight-eng540-eng540-patch-1/backend/app/api/flights.py ---
 """
 Flight API Endpoints — v4.0 (TIER 3 Complete)
 Prefix: /api/v1/flights
@@ -18,11 +19,13 @@ FIXES:
              New code: /api/v1/live/positions reads CurrentAircraftState table
              (single query, denormalized, updated every ingestion cycle).
              Evidence: original flights.py lines 35-43 — db.query(TrackTelemetry)
-             inside a for-loop over sessions.
-
-  [FIX-AUTH] /search comes before /{session_id} in route order.
+             inside a for-loop over sessions.[FIX-AUTH] /search comes before /{session_id} in route order.
              FastAPI matches routes top-down; if /{session_id} is first,
              "search" would be interpreted as a session_id integer → 422 error.
+             
+  [FIX-VAL]  Added 'id' field to nested entities in _session_to_dict to satisfy
+             Pydantic strict validation and prevent 500 Internal Server Error
+             in history query endpoints.
 """
 import io
 import csv
@@ -125,7 +128,7 @@ def get_flight_detail(
             "session_id": session_id,
             "fr24_id":    session.fr24_id,
             "callsign":   session.callsign,
-            "points": [
+            "points":[
                 {
                     "ts":   int(t.timestamp.timestamp()),
                     "lat":  t.latitude,
@@ -249,7 +252,7 @@ def legacy_get_flights(
         "page":      page,
         "page_size": page_size,
         "pages":     pages,
-        "data": [
+        "data":[
             {
                 "id":                    p.session_id,
                 "icao24":               p.icao24,
@@ -296,21 +299,25 @@ def _session_to_dict(s, detail: bool = False) -> dict:
         "max_altitude_m":    s.max_altitude_m,
         "total_distance_km": s.total_distance_km,
         "aircraft": {
+            "id":           s.aircraft.id,           # ADDED FIX: Required by Pydantic
             "icao24":       s.aircraft.icao24       if s.aircraft else None,
             "registration": s.aircraft.registration if s.aircraft else None,
             "type_code":    s.aircraft.type_code    if s.aircraft else None,
             "model":        s.aircraft.model        if s.aircraft else None,
         } if s.aircraft else None,
         "operator": {
+            "id":        s.operator.id,              # ADDED FIX: Required by Pydantic
             "icao_code": s.operator.icao_code if s.operator else None,
             "name":      s.operator.name      if s.operator else None,
         } if s.operator else None,
         "dep_airport": {
+            "id":        s.dep_airport.id,           # ADDED FIX: Required by Pydantic
             "icao_code": s.dep_airport.icao_code if s.dep_airport else None,
             "iata_code": s.dep_airport.iata_code if s.dep_airport else None,
             "name":      s.dep_airport.name      if s.dep_airport else None,
         } if s.dep_airport else None,
         "arr_airport": {
+            "id":        s.arr_airport.id,           # ADDED FIX: Required by Pydantic
             "icao_code": s.arr_airport.icao_code if s.arr_airport else None,
             "iata_code": s.arr_airport.iata_code if s.arr_airport else None,
             "name":      s.arr_airport.name      if s.arr_airport else None,
@@ -363,3 +370,4 @@ def _export_sessions_csv(sessions, filename: str = "export.csv") -> StreamingRes
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+#--- END OF FILE ---
