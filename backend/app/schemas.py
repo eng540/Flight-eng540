@@ -1,12 +1,12 @@
 """
-Enterprise Pydantic Schemas (v3.2 — Multi-Source Ready)
+Enterprise Pydantic Schemas (v3.2 — Multi-Source Ready + Backward Compatible)
 Strict validation and typing for the Snowflake Architecture.
 
 CHANGES FROM v3.1:
   RawIngestionPayload     → +data_source
   LivePositionResponse    → +data_source
-                            Evidence: Support for OpenSky, AirLabs, and FR24.
-  HistoryQueryResponse    → uses FlightSearchItem for performance
+  LivePositionsResponse   → kept for backward compatibility (but marked)
+  HistoryQueryResponse    → uses FlightSearchItem for performance (added missing model)
 """
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional, List, Any, Dict
@@ -133,6 +133,14 @@ class LivePositionResponse(BaseModel):
     data_source:   Optional[str]   = None   # NEW in v3.2
 
 
+# ── Backward Compatible Wrapper (kept for existing imports) ────────────────
+class LivePositionsResponse(BaseModel):
+    """Wrapper for live positions list (backward compatibility with v3.1)"""
+    total: int
+    active: int
+    data: List[LivePositionResponse]
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # 4. FLIGHT DETAIL (Full session + trajectory)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -145,7 +153,7 @@ class TrajectoryPoint(BaseModel):
     vel: Optional[float] = None
     hdg: Optional[float] = None
     vspd: Optional[float] = None
-    src: Optional[str] = None   # NEW in v3.2 (data source per point)
+    src: Optional[str] = None   # NEW in v3.2
 
 class TrajectoryResponse(BaseModel):
     session_id: int
@@ -182,10 +190,7 @@ class FlightDetailResponse(BaseModel):
 # ═════════════════════════════════════════════════════════════════════════════
 
 class FlightSearchItem(BaseModel):
-    """
-    Lightweight version of FlightSessionResponse for history queries.
-    Does NOT include tracks to improve performance.
-    """
+    """Lightweight version for history queries (does NOT include tracks)"""
     model_config = ConfigDict(from_attributes=True)
 
     session_id: int
@@ -196,7 +201,6 @@ class FlightSearchItem(BaseModel):
     first_seen_ts: datetime
     last_seen_ts: datetime
 
-    # Simplified airport info
     dep_airport_icao: Optional[str] = None
     dep_airport_iata: Optional[str] = None
     dep_airport_name: Optional[str] = None
@@ -204,16 +208,13 @@ class FlightSearchItem(BaseModel):
     arr_airport_iata: Optional[str] = None
     arr_airport_name: Optional[str] = None
 
-    # Simplified aircraft info
     aircraft_icao24: Optional[str] = None
     aircraft_type: Optional[str] = None
     aircraft_model: Optional[str] = None
 
-    # Operator info
     operator_icao: Optional[str] = None
     operator_name: Optional[str] = None
 
-    # Flight statistics
     max_altitude_m: Optional[float] = None
     total_distance_km: Optional[float] = None
     duration_seconds: Optional[int] = None
@@ -349,7 +350,7 @@ class HistoryQueryResponse(BaseModel):
     page:         int
     page_size:    int
     pages:        int
-    data:         List[FlightSearchItem]   # ✅ Fixed: uses FlightSearchItem
+    data:         List[FlightSearchItem]   # ✅ Now uses lightweight item
     aggregations: Optional[HistoryAggregations] = None
 
 
