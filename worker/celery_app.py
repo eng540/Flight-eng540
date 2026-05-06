@@ -1,4 +1,7 @@
-"""Celery application – supports redis:// and rediss:// (Upstash/TLS)."""
+"""
+Celery application – supports redis:// and rediss:// (Upstash/TLS).
+v3.0 — Multi-Source Hybrid Engine Configuration
+"""
 import os
 import ssl
 import logging
@@ -38,12 +41,23 @@ celery_app.conf.update(
     beat_schedule_filename="/tmp/celerybeat-schedule",
 
     beat_schedule={
-        # ── Geo-filtered ingestion every 60 min (was 30, reduced to ease load)
-        "ingest-geo-every-60-minutes": {
-            "task": "worker.tasks.ingest_recent_geo_task",
+        # ── 1. OpenSky: Primary Free Source (Every 1 Minute) ──
+        "ingest-live-opensky": {
+            "task": "worker.tasks.ingest_live_opensky_task",
+            "schedule": 60.0,
+        },
+        # ── 2. AirLabs: Secondary Free Source (Every 1 Hour) ──
+        "ingest-live-airlabs": {
+            "task": "worker.tasks.ingest_live_airlabs_task",
             "schedule": 3600.0,
         },
-        # ── Cleanup daily (keeps all data by default; DATA_RETENTION_DAYS=0)
+        # ── 3. FR24: Fallback/Premium Source (Every 1 Hour) ──
+        "ingest-live-fr24": {
+            "task": "worker.tasks.ingest_live_fr24_task",
+            "schedule": 3600.0,
+        },
+        
+        # ── System Maintenance ──
         "retry-ops-chunks": {
             "task": "worker.tasks.operations_task.retry_chunks_task",
             "schedule": 30.0,
@@ -54,19 +68,20 @@ celery_app.conf.update(
             "schedule": 86400.0,
             "args": (0,),
         },
-        # NOTE: ingest_flights_task (global, no geo) REMOVED.
-        # It was calling /flights/all which times out from cloud IPs exactly
-        # like /flights/area.  Removing it stops wasting one worker thread
-        # on 4-minute timeout loops every 5 minutes.
     },
 
     task_routes={
-        "worker.tasks.ingest_recent_geo_task":    {"queue": "ingestion"},
+        "worker.tasks.ingest_live_opensky_task":  {"queue": "ingestion"},
+        "worker.tasks.ingest_live_airlabs_task":  {"queue": "ingestion"},
+        "worker.tasks.ingest_live_fr24_task":     {"queue": "ingestion"},
         "worker.tasks.ingest_historical_flights": {"queue": "ingestion"},
-        "worker.tasks.ingest_flights_task":       {"queue": "ingestion"},
         "worker.tasks.cleanup_old_data_task":     {"queue": "maintenance"},
         "worker.tasks.operations_task.execute_operation_task": {"queue": "ingestion"},
         "worker.tasks.operations_task.retry_chunks_task":      {"queue": "maintenance"},
+        
+        # Legacy routes (kept to prevent unregistered task warnings)
+        "worker.tasks.ingest_recent_geo_task":    {"queue": "ingestion"},
+        "worker.tasks.ingest_flights_task":       {"queue": "ingestion"},
         "worker.tasks.run_realtime_radar_task":   {"queue": "ingestion"},
     },
 )
@@ -101,15 +116,22 @@ def health_check_task(self):
 @worker_ready.connect
 def trigger_initial_ingestion(sender, **kwargs):
     """
-    SRE Fix: Trigger ingestion immediately on startup to prevent 
-    the 'Silent Empty UI' issue while waiting for the 60-min schedule.
+    SRE Fix: Trigger all live ingestion tasks immediately on startup.
+    This prevents the 'Silent Empty UI' issue while waiting for the schedules to tick.
     """
-    logger.info("[SRE] Worker ready! Triggering initial geo-ingestion...")
-    # نرسل المهمة إلى الطابور فوراً
+    logger.info("[SRE] Worker ready! Triggering initial multi-source ingestion...")
+    
     sender.app.send_task(
-        "worker.tasks.ingest_recent_geo_task",
-        queue="ingestion",
-        kwargs={"lookback_hours": 2}
+        "worker.tasks.ingest_live_opensky_task",
+        queue="ingestion"
+    )
+    sender.app.send_task(
+        "worker.tasks.ingest_live_airlabs_task",
+        queue="ingestion"
+    )
+    sender.app.send_task(
+        "worker.tasks.ingest_live_fr24_task",
+        queue="ingestion"
     )
 
 
