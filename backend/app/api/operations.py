@@ -1,3 +1,4 @@
+#--- START OF FILE Flight-eng540-eng540-patch-1/backend/app/api/operations.py ---
 """
 Operations Board API (System Design §5–§7)
 Prefix: /api/v1/operations
@@ -65,7 +66,7 @@ def get_credit_rates(db: Session = Depends(get_db)):
     Evidence: §4 Pre-flight Engine — "api_credit_rates (DB table — updatable)"
     """
     rates = CreditRatesCRUD.get_all(db)
-    return [ApiCreditRateResponse.model_validate(r) for r in rates]
+    return[ApiCreditRateResponse.model_validate(r) for r in rates]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -174,7 +175,7 @@ def get_operation(
     response = _op_to_response(op)
     if include_chunks:
         chunks = ChunksCRUD.get_chunks_for_operation(db, operation_id)
-        response.chunks = [_chunk_to_item(c) for c in chunks]
+        response.chunks =[_chunk_to_item(c) for c in chunks]
     return response
 
 
@@ -475,7 +476,42 @@ def export_results(
             "country_code": operator.country_code or "",
         })
 
-    # ── Flight Summaries / Live / Historic / Tracks ──────────────────────
+    # ── ADDED FIX: Flight Tracks ──────────────────────────────────────────
+    elif op.capability_type == "flight_tracks":
+        from app.models import TrackTelemetry
+
+        # Query the TrackTelemetry table which holds the actual track points
+        tracks = (
+            db.query(TrackTelemetry)
+            .filter(TrackTelemetry.operation_id == operation_id)
+            .order_by(TrackTelemetry.timestamp.asc())
+            .all()
+        )
+
+        if not tracks:
+            raise HTTPException(
+                status_code=404,
+                detail="لا توجد نتائج مسارات جاهزة للتصدير. قد تكون العملية لم تكتمل بعد، أو فشلت القطع (chunks)."
+            )
+
+        writer = csv.DictWriter(output, fieldnames=[
+            "timestamp", "latitude", "longitude", "altitude_m", 
+            "velocity_kmh", "heading_deg", "vspeed_fpm", "is_on_ground"
+        ])
+        writer.writeheader()
+        for t in tracks:
+            writer.writerow({
+                "timestamp":    t.timestamp.isoformat() if t.timestamp else "",
+                "latitude":     t.latitude,
+                "longitude":    t.longitude,
+                "altitude_m":   t.altitude_m if t.altitude_m is not None else "",
+                "velocity_kmh": t.velocity_kmh if t.velocity_kmh is not None else "",
+                "heading_deg":  t.heading_deg if t.heading_deg is not None else "",
+                "vspeed_fpm":   t.vspeed_fpm if t.vspeed_fpm is not None else "",
+                "is_on_ground": "Yes" if t.is_on_ground else "No",
+            })
+
+    # ── Flight Summaries / Live / Historic ────────────────────────────────
     else:
         sessions = (
             db.query(FactFlightSession)
@@ -626,3 +662,4 @@ def _dispatch_operation_task(operation_id: int) -> None:
         logging.getLogger(__name__).error(
             f"[Operations] Failed to dispatch task for op {operation_id}: {exc}"
         )
+#--- END OF FILE ---
