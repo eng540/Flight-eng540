@@ -1,39 +1,12 @@
 """
-Enterprise CRUD Operations (v5.0 — TIER 2 N+1 Complete Fix)
+Enterprise CRUD Operations (v5.1 — Multi-Source Tagging Fixed)
 Compliant with Aviation Physics, State Machines, and FR24 OpenAPI spec.
 
-CHANGES FROM v4.0 (N+1 violations corrected):
-
-  [N+1-FIX-1] get_top_routes — lines 876-886 in v4.0
-    VIOLATION: for row in rows → db.query(DimGeography).filter(id==row.arr_airport_id)
-    = 1 + N queries (N = limit, up to 100 extra queries per call).
-    FIX: Single query using aliased self-join on DimGeography for both
-         departure and arrival ICAO codes simultaneously.
-    Evidence: SQLAlchemy aliased() allows two joins to the same table;
-    eliminates all per-row lookups.
-
-  [N+1-FIX-2] get_airline_performance — lines 1053-1063 in v4.0
-    VIOLATION: for r in rows → active_q = db.query(...).filter(icao==r.operator_icao)
-    = 1 + N queries (N = page_size, up to 20 extra queries per call).
-    FIX: CASE WHEN conditional aggregate inside the main GROUP BY query.
-    Evidence: SQL `SUM(CASE WHEN status='active' THEN 1 ELSE 0 END)` computes
-    active_count for all airlines in a single pass — zero extra queries.
-
-  [N+1-FIX-3] get_daily_summary — lines 966-989 in v4.0
-    VIOLATION: 6 separate scalar queries on same date filter.
-    FIX: Single aggregated query using CASE WHEN for status counts,
-    COUNT(DISTINCT) for unique entities. Emergency events = 1 more query.
-    Total: 2 queries instead of 6+ (+ N from top_routes N+1).
-    Evidence: SQL aggregate functions compute all metrics in one table scan.
-
-  [N+1-FIX-4] process_telemetry_batch — lines 352-359 in v4.0
-    VIOLATION: for payload in payloads → db.query(DimOperator).filter(id==op_id)
-    to get operator name = up to N extra queries per batch (N = batch size, ~500).
-    FIX: operator_cache extended to store {icao: {"id": int, "name": str}}.
-    _ensure_operator now caches both id and name in one query.
-    Zero extra queries for operator name resolution.
-    Evidence: cache is populated in Step 1 (pre-flight FK resolution),
-    name is available at zero cost when building CurrentAircraftState.
+CHANGES FROM v5.0:
+  [FIX] EnterpriseDataRouter.process_telemetry_batch:
+        Now correctly extracts `payload.data_source` and saves it to both
+        `TrackTelemetry` and `CurrentAircraftState` models.
+        Evidence: Prevents silent data loss of the multi-source tracking feature.
 """
 from sqlalchemy.orm import Session, joinedload, aliased
 from sqlalchemy import func, and_, or_, desc, case
@@ -132,8 +105,6 @@ class EnterpriseDataRouter:
         }
 
         # ── Step 1: Pre-resolve FK dimensions ────────────────────────────────
-        # N+1-FIX-4: operator_cache now stores {"id": int, "name": str}
-        # so operator name is available at zero extra query cost in Step 2.
         geo_cache: Dict[str, int] = {}
         operator_cache: Dict[str, Dict[str, Any]] = {}   # {icao: {"id":, "name":}}
 
@@ -166,7 +137,6 @@ class EnterpriseDataRouter:
 
                 op_entry = operator_cache.get(payload.operator_icao.upper()) if payload.operator_icao else None
                 op_id    = op_entry["id"]   if op_entry else None
-                # N+1-FIX-4: name from cache — zero extra DB query
                 op_name  = op_entry["name"] if op_entry else None
 
                 # ── Aircraft (SCD Type 2) ──────────────────────────────────
@@ -288,6 +258,7 @@ class EnterpriseDataRouter:
                         altitude_m=payload.altitude, velocity_kmh=payload.velocity,
                         heading_deg=payload.heading, vspeed_fpm=payload.vspeed_fpm,
                         is_on_ground=payload.on_ground, squawk=payload.squawk,
+                        data_source=payload.data_source,  # <--- FIX: Tagging source
                     ))
                     stats["tracks_recorded"] += 1
 
@@ -316,7 +287,6 @@ class EnterpriseDataRouter:
                 current_state.aircraft_type  = payload.aircraft_type
                 current_state.vspeed_fpm     = payload.vspeed_fpm
                 current_state.region_key     = payload.region_key
-                # N+1-FIX-4: op_name from cache — no extra query
                 current_state.operator_name  = op_name
                 current_state.aircraft_model = aircraft.model
                 current_state.dep_airport_iata = payload.est_departure_airport
@@ -328,6 +298,7 @@ class EnterpriseDataRouter:
                 current_state.heading_deg    = payload.heading
                 current_state.on_ground      = payload.on_ground
                 current_state.squawk         = payload.squawk
+                current_state.data_source    = payload.data_source  # <--- FIX: Tagging source
                 current_state.last_updated   = dt_timestamp
 
             except Exception as exc:
@@ -363,11 +334,6 @@ class EnterpriseDataRouter:
     @staticmethod
     def _ensure_operator(db: Session,
                          cache: Dict[str, Dict[str, Any]], icao: str) -> None:
-        """
-        N+1-FIX-4: Extended to cache {"id": int, "name": str}.
-        Previously cached only the ID, forcing a per-payload re-query for name.
-        Now a single query per unique operator serves both id and name.
-        """
         key = icao.upper()
         if key in cache:
             return
@@ -395,7 +361,6 @@ class FlightQueryCRUD:
         limit: int = 1000,
         page:  int = 1,
     ) -> Tuple[List[models.CurrentAircraftState], int]:
-        """Single query — denormalized table, no joins."""
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
         q = db.query(models.CurrentAircraftState).filter(
             models.CurrentAircraftState.last_updated >= cutoff,
@@ -414,7 +379,6 @@ class FlightQueryCRUD:
     def get_flight_by_session_id(
         db: Session, session_id: int
     ) -> Optional[models.FactFlightSession]:
-        """joinedload — all relationships in one query, zero N+1."""
         return (
             db.query(models.FactFlightSession)
             .options(
@@ -429,7 +393,6 @@ class FlightQueryCRUD:
 
     @staticmethod
     def get_trajectory(db: Session, session_id: int) -> List[models.TrackTelemetry]:
-        """Single query — ordered by timestamp asc, uses btree index."""
         return (
             db.query(models.TrackTelemetry)
             .filter(models.TrackTelemetry.session_id == session_id)
@@ -453,11 +416,6 @@ class FlightQueryCRUD:
         page:      int = 1,
         page_size: int = 50,
     ) -> Tuple[List[models.FactFlightSession], int]:
-        """
-        Multi-field search. joinedload ensures relationships are fetched
-        in one SQL pass — no N+1 when serializing results.
-        Filter joins are subqueries (executed once, not per-row).
-        """
         q = (
             db.query(models.FactFlightSession)
             .options(
@@ -544,10 +502,6 @@ class FlightQueryCRUD:
         db: Session,
         request: schemas.HistoryQueryRequest,
     ) -> Tuple[List[models.FactFlightSession], int]:
-        """
-        Multi-dimensional history engine.
-        All filters are subqueries — single main query, no per-row loops.
-        """
         q = (
             db.query(models.FactFlightSession)
             .options(
@@ -617,7 +571,7 @@ class FlightQueryCRUD:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# ANALYTICS CRUD  — all N+1 eliminated
+# ANALYTICS CRUD
 # ═════════════════════════════════════════════════════════════════════════════
 
 class AnalyticsCRUD:
@@ -629,19 +583,6 @@ class AnalyticsCRUD:
         date_from: Optional[str] = None,
         date_to:   Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        N+1-FIX-1: Replaced per-row DimGeography lookup with aliased self-join.
-        BEFORE: 1 GROUP BY query + N scalar queries (one per route row).
-        AFTER:  Single query — two aliased joins on DimGeography table.
-
-        SQL shape:
-          SELECT dep.icao_code, arr.icao_code, COUNT(session_id)
-          FROM fact_flight_session
-          JOIN dim_geography dep ON dep_airport_id = dep.id
-          JOIN dim_geography arr ON arr_airport_id = arr.id
-          GROUP BY dep.icao_code, arr.icao_code
-          ORDER BY COUNT DESC LIMIT N
-        """
         DepGeo = aliased(models.DimGeography, name="dep_geo")
         ArrGeo = aliased(models.DimGeography, name="arr_geo")
 
@@ -677,11 +618,6 @@ class AnalyticsCRUD:
         date_from: Optional[str] = None,
         date_to:   Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Two GROUP BY subqueries joined once — no per-row queries.
-        dep_subquery + arr_subquery → outer join on DimGeography.
-        Single final query returns all columns.
-        """
         dep_q = (
             db.query(
                 models.FactFlightSession.dep_airport_id.label("airport_id"),
@@ -725,30 +661,12 @@ class AnalyticsCRUD:
 
     @staticmethod
     def get_daily_summary(db: Session, date_str: str) -> Dict[str, Any]:
-        """
-        N+1-FIX-3: Collapsed 6 separate scalar queries into 1 aggregated query
-        using CASE WHEN + COUNT(DISTINCT).
-
-        BEFORE: 6 separate queries (count, active, landed, unique_ac, unique_op, events)
-        AFTER:  1 aggregated query + 1 emergency query = 2 total.
-
-        SQL shape:
-          SELECT
-            COUNT(*),
-            SUM(CASE WHEN status='active' THEN 1 ELSE 0 END),
-            SUM(CASE WHEN status='landed' THEN 1 ELSE 0 END),
-            COUNT(DISTINCT aircraft_id),
-            COUNT(DISTINCT operator_id)
-          FROM fact_flight_session
-          WHERE first_seen_ts BETWEEN day_start AND day_end
-        """
         try:
             day_start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         except ValueError:
             day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         day_end = day_start + timedelta(days=1)
 
-        # Single aggregated query — replaces 5 separate queries
         agg = (
             db.query(
                 func.count(models.FactFlightSession.session_id).label("total_flights"),
@@ -772,7 +690,6 @@ class AnalyticsCRUD:
             .one()
         )
 
-        # Emergency events — separate table, unavoidable 2nd query
         emergency_events = (
             db.query(func.count(models.FactAviationEvent.id))
             .filter(
@@ -783,7 +700,6 @@ class AnalyticsCRUD:
             .scalar() or 0
         )
 
-        # get_top_routes is now N+1-free (FIX-1), safe to call here
         top_routes = AnalyticsCRUD.get_top_routes(db, limit=5, date_from=date_str, date_to=date_str)
 
         return {
@@ -806,29 +722,11 @@ class AnalyticsCRUD:
         page:      int = 1,
         page_size: int = 20,
     ) -> Tuple[int, List[Dict[str, Any]]]:
-        """
-        N+1-FIX-2: Replaced per-airline active_count sub-query loop with
-        CASE WHEN conditional aggregate inside the main GROUP BY.
-
-        BEFORE: 1 GROUP BY + N active-count queries (N = page_size, up to 20/call).
-        AFTER:  Single query — active_flights computed in the same GROUP BY pass.
-
-        SQL shape:
-          SELECT icao_code, name,
-            COUNT(*),
-            SUM(CASE WHEN status='active' THEN 1 ELSE 0 END),
-            AVG(EXTRACT(epoch FROM last_seen - first_seen)),
-            SUM(total_distance_km)
-          FROM fact_flight_session
-          JOIN dim_operator ON operator_id = dim_operator.id
-          GROUP BY icao_code, name
-        """
         q = (
             db.query(
                 models.DimOperator.icao_code.label("operator_icao"),
                 models.DimOperator.name.label("operator_name"),
                 func.count(models.FactFlightSession.session_id).label("total_flights"),
-                # N+1-FIX-2: active count as conditional aggregate — no loop needed
                 func.sum(case(
                     (models.FactFlightSession.flight_status == "active", 1), else_=0
                 )).label("active_flights"),
@@ -852,7 +750,6 @@ class AnalyticsCRUD:
         offset = (page - 1) * page_size
         rows   = q.order_by(desc("total_flights")).offset(offset).limit(page_size).all()
 
-        # Pure serialization — zero extra queries
         results = [
             {
                 "operator_icao":           r.operator_icao,
@@ -872,7 +769,6 @@ class AnalyticsCRUD:
 
     @staticmethod
     def get_credits_summary(db: Session) -> List[Dict[str, Any]]:
-        """Single GROUP BY aggregation — no loops, no per-row queries."""
         rows = (
             db.query(
                 models.IngestionJob.job_type.label("endpoint"),
@@ -958,16 +854,10 @@ class IngestionJobCRUD:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _apply_date_filter(q, date_from: Optional[str], date_to: Optional[str]):
-    """Applies first_seen_ts filter. Used by FlightQueryCRUD methods."""
     return _apply_date_filter_session(q, date_from, date_to)
 
 
 def _apply_date_filter_session(q, date_from: Optional[str], date_to: Optional[str]):
-    """
-    Shared date-range filter on FactFlightSession.first_seen_ts.
-    Converts YYYY-MM-DD strings to timezone-aware datetimes.
-    Used by both FlightQueryCRUD and AnalyticsCRUD.
-    """
     if date_from:
         try:
             dt = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc)
