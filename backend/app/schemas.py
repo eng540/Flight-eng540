@@ -1,10 +1,6 @@
 """
-Enterprise Pydantic Schemas (v3.4 — Multi-Source Ready + Fix)
+Enterprise Pydantic Schemas (v3.5 — Multi-Source Ready + Fixes)
 Strict validation and typing for the Snowflake Architecture.
-
-CHANGES FROM v3.3:
-  Restored missing `FlightSearchItem` and `FlightSearchResponse` definitions
-  which caused a NameError on startup.
 """
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional, List, Any, Dict
@@ -130,6 +126,11 @@ class LivePositionResponse(BaseModel):
     session_id:    Optional[int]   = None
     data_source:   Optional[str]   = None
 
+class LivePositionsResponse(BaseModel):
+    total:  int
+    active: int  # on_ground=False count
+    data:   List[LivePositionResponse]
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 4. FLIGHT DETAIL (Full session + trajectory)
@@ -174,7 +175,6 @@ class FlightDetailResponse(BaseModel):
 
     trajectory:  Optional[TrajectoryResponse]   = None
 
-# ── FIX ADDED HERE: Restored missing search schemas ──
 FlightSearchItem = FlightDetailResponse
 
 class FlightSearchResponse(BaseModel):
@@ -340,7 +340,7 @@ class HealthCheck(BaseModel):
     status:    str
     timestamp: datetime
     database:  str
-    version:   str = "3.4.0-MultiSource"
+    version:   str = "3.5.0-MultiSource"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
