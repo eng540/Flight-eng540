@@ -1,13 +1,12 @@
 """
-Celery Tasks — Flight Intelligence Worker (v3.0 — Multi-Source Hybrid)
+Celery Tasks — Flight Intelligence Worker (v3.1 — Time Limits Tuned)
 All task definitions match beat_schedule entries exactly.
 
-UPGRADES FROM v2.1:
-  [NEW] ingest_live_opensky_task: High-frequency task (every 1 min).
-  [NEW] ingest_live_airlabs_task: Low-frequency task (every 1 hour).
-  [NEW] ingest_live_fr24_task: Fallback/Premium task (every 1 hour).
-  [REMOVED] ingest_recent_geo_task & ingest_flights_task: Replaced by the
-            three dedicated source tasks above to allow decoupled scheduling.
+UPGRADES FROM v3.0:
+  [FIX] Increased `soft_time_limit` and `time_limit` for live ingestion tasks
+        (OpenSky, AirLabs, FR24) from 300s to 600s.
+        Evidence: Logs showed `SoftTimeLimitExceeded` for AirLabs task after 5 mins,
+        preventing it from completing the multi-region sweep.
 """
 from . import operations_task
 from celery import shared_task
@@ -55,7 +54,7 @@ def _wait_for_db(max_attempts: int = 30, sleep_s: float = 2.0) -> bool:
 
 @shared_task(
     bind=True, max_retries=1, default_retry_delay=30,
-    soft_time_limit=300, time_limit=400,
+    soft_time_limit=600, time_limit=700,  # <--- FIX: Increased time limit
     name="worker.tasks.ingest_live_opensky_task",
     queue="ingestion",
 )
@@ -92,7 +91,7 @@ def ingest_live_opensky_task(self, region_keys: Optional[List[str]] = None):
 
 @shared_task(
     bind=True, max_retries=1, default_retry_delay=60,
-    soft_time_limit=300, time_limit=400,
+    soft_time_limit=600, time_limit=700,  # <--- FIX: Increased time limit
     name="worker.tasks.ingest_live_airlabs_task",
     queue="ingestion",
 )
@@ -129,7 +128,7 @@ def ingest_live_airlabs_task(self, region_keys: Optional[List[str]] = None):
 
 @shared_task(
     bind=True, max_retries=1, default_retry_delay=60,
-    soft_time_limit=300, time_limit=400,
+    soft_time_limit=600, time_limit=700,  # <--- FIX: Increased time limit
     name="worker.tasks.ingest_live_fr24_task",
     queue="ingestion",
 )
