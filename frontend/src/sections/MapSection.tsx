@@ -1,28 +1,15 @@
 /**
- * MapSection.tsx — v4.0 (TIER 4 PART B)
+ * MapSection.tsx — v4.1 (Multi-Source Indicators)
  *
- * FIX: Replaced /flights/filter → liveApi.getPositions (/api/v1/live/positions)
- *      Evidence: business requirement — live map must use dedicated live endpoint.
- *      Old endpoint returned full session objects; new returns lightweight LivePosition.
- *
- * NEW: Auto-refresh every 60 seconds.
- *      Evidence: business requirement "Auto refresh (60s)"
- *
- * NEW: Arabic popup content with all FR24 fields.
- *      Evidence: business requirement "Arabic labels ONLY"
- *
- * NEW: fr24_id, flight_number, vspeed_fpm displayed in popup and detail panel.
- *      Evidence: FR24 OpenAPI FlightPositionsFull fields now stored in DB.
- *
- * NEW: Active aircraft counter (on_ground=false).
- *      Evidence: LivePositionsResponse.active field from /api/v1/live/positions.
+ * UPGRADES:
+ *   - Added visual indicators for data_source (AirLabs, FR24, OpenSky).
+ *   - Displays the source in the map popup and the detail panel.
  */
 import { useEffect, useRef, useState, useCallback } from 'react';
 import {
   Card, CardContent, CardHeader, CardTitle,
 } from '@/components/ui/card';
 import { Button }  from '@/components/ui/button';
-import { Input }   from '@/components/ui/input';
 import { Label }   from '@/components/ui/label';
 import {
   Select, SelectContent, SelectItem,
@@ -38,6 +25,14 @@ declare global {
 }
 
 const REFRESH_INTERVAL_MS = 60_000; // 60 seconds
+
+// Helper to get source icon
+const getSourceIcon = (source?: string | null) => {
+  if (source === 'AIRLABS') return '✈️ AirLabs';
+  if (source === 'FR24')    return '🌍 FR24';
+  if (source === 'OPENSKY') return '📡 OpenSky';
+  return '❓ غير معروف';
+};
 
 export function MapSection() {
   const mapDiv     = useRef<HTMLDivElement>(null);
@@ -111,10 +106,6 @@ export function MapSection() {
   }, [mapReady, regions, showBoxes]);
 
   // ── Fetch live positions ──────────────────────────────────────────────────
-  /**
-   * FIX: uses liveApi.getPositions() → GET /api/v1/live/positions
-   * Evidence: business requirement; old filterFlights → /flights/filter (deleted).
-   */
   const fetchPositions = useCallback(async () => {
     setLoading(true);
     try {
@@ -154,7 +145,6 @@ export function MapSection() {
     const withPos = positions.filter(p => p.latitude != null && p.longitude != null);
     withPos.forEach(p => {
       const heading = p.heading_deg ?? 0;
-      // Color: red = emergency squawk, blue = airborne, grey = ground
       const color = ['7500','7600','7700'].includes(p.squawk || '')
         ? '#ef4444'
         : p.on_ground ? '#6b7280' : '#3b82f6';
@@ -166,12 +156,13 @@ export function MapSection() {
         iconAnchor: [11, 11],
       });
 
-      // Arabic popup content — FR24 fields
+      const sourceLabel = getSourceIcon(p.data_source);
+
       const popupHtml = `
         <div dir="rtl" style="min-width:200px;font-family:'Tajawal',sans-serif">
-          <div style="font-weight:700;font-size:14px;margin-bottom:6px">
-            ✈ ${p.callsign || p.icao24}
-            ${p.flight_number ? `<span style="color:#6b7280;font-size:12px"> · ${p.flight_number}</span>` : ''}
+          <div style="font-weight:700;font-size:14px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center">
+            <span>✈ ${p.callsign || p.icao24}</span>
+            <span style="font-size:10px;background:#f3f4f6;padding:2px 6px;border-radius:4px;color:#374151">${sourceLabel}</span>
           </div>
           <table style="font-size:12px;width:100%;border-collapse:collapse">
             ${row('ICAO24', `<code>${p.icao24}</code>`)}
@@ -186,7 +177,6 @@ export function MapSection() {
             ${p.heading_deg != null ? row('الاتجاه',  `${Math.round(p.heading_deg)}°`) : ''}
             ${p.squawk ? row('Squawk', `<b>${p.squawk}</b>${['7500','7600','7700'].includes(p.squawk) ? ' ⚠️' : ''}`) : ''}
             ${row('الحالة', p.on_ground ? '🟡 على الأرض' : '🟢 في الجو')}
-            ${p.region_key ? row('المنطقة', p.region_key) : ''}
           </table>
           <div style="margin-top:8px;text-align:center">
             <button onclick="window._selectFlight('${p.icao24}')"
@@ -201,7 +191,6 @@ export function MapSection() {
         .addTo(layer);
     });
 
-    // Bridge: popup "عرض التفاصيل" button → React state
     (window as unknown as { _selectFlight: (icao24: string) => void })._selectFlight =
       (icao24: string) => {
         const found = positions.find(p => p.icao24 === icao24);
@@ -303,11 +292,6 @@ export function MapSection() {
               ))}
             </div>
           )}
-
-          {/* Auto-refresh notice */}
-          <p className="text-xs text-muted-foreground mt-2">
-            يتجدد تلقائياً كل 60 ثانية — مصدر البيانات: Flightradar24 API
-          </p>
         </CardContent>
       </Card>
 
@@ -349,6 +333,9 @@ export function MapSection() {
                   )}
                   <Badge variant={selected.on_ground ? 'secondary' : 'default'}>
                     {selected.on_ground ? '🟡 على الأرض' : '🟢 في الجو'}
+                  </Badge>
+                  <Badge variant="outline" className="bg-muted">
+                    {getSourceIcon(selected.data_source)}
                   </Badge>
                   {selected.squawk && ['7500','7600','7700'].includes(selected.squawk) && (
                     <Badge variant="destructive">⚠️ طوارئ {selected.squawk}</Badge>
