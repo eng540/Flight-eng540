@@ -1,6 +1,6 @@
 #--- START OF FILE Flight-eng540-eng540-patch-1/backend/app/api/flights.py ---
 """
-Flight API Endpoints — v4.0 (TIER 3 Complete)
+Flight API Endpoints — v4.1 (Multi-Source Tagging)
 Prefix: /api/v1/flights
 
 ENDPOINTS:
@@ -12,20 +12,9 @@ ENDPOINTS:
 LIVE MAP:
   GET  /api/v1/live/positions   ← in live.py (separate router)
 
-FIXES:
-  [FIX-N+1] Removed TrackTelemetry-per-session loop.
-             Old code in flights.py queried TrackTelemetry individually
-             for every session in the result set → 501 queries for 500 aircraft.
-             New code: /api/v1/live/positions reads CurrentAircraftState table
-             (single query, denormalized, updated every ingestion cycle).
-             Evidence: original flights.py lines 35-43 — db.query(TrackTelemetry)
-             inside a for-loop over sessions.[FIX-AUTH] /search comes before /{session_id} in route order.
-             FastAPI matches routes top-down; if /{session_id} is first,
-             "search" would be interpreted as a session_id integer → 422 error.
-             
-  [FIX-VAL]  Added 'id' field to nested entities in _session_to_dict to satisfy
-             Pydantic strict validation and prevent 500 Internal Server Error
-             in history query endpoints.
+CHANGES:
+  - Added `src=t.data_source` to trajectory endpoints to expose the data provider
+    (OPENSKY, AIRLABS, FR24) to the frontend.
 """
 import io
 import csv
@@ -137,6 +126,7 @@ def get_flight_detail(
                     "vel":  t.velocity_kmh,
                     "hdg":  t.heading_deg,
                     "vspd": t.vspeed_fpm,
+                    "src":  t.data_source,  # <--- FIX: Expose data source
                 }
                 for t in tracks
             ],
@@ -172,6 +162,7 @@ def get_flight_trajectory(
                 vel=t.velocity_kmh,
                 hdg=t.heading_deg,
                 vspd=t.vspeed_fpm,
+                src=t.data_source,  # <--- FIX: Expose data source
             )
             for t in tracks
         ],
@@ -195,7 +186,6 @@ def get_aircraft_history(
     """
     All recorded sessions for a specific aircraft ICAO24.
     Supports date range filtering and CSV export.
-    Evidence: business requirement GET /api/v1/aircraft/{icao24}/history
     """
     sessions, total = FlightQueryCRUD.get_aircraft_history(
         db,
@@ -242,7 +232,6 @@ def legacy_get_flights(
     """
     Legacy endpoint — kept for frontend backward compat during TIER 4 migration.
     Reads from CurrentAircraftState (single query, no N+1).
-    FIX-N+1: original code queried TrackTelemetry per session (501 queries → 1).
     """
     from app.crud import FlightQueryCRUD as FQ
     positions, total = FQ.get_live_positions(db, limit=page_size, page=page)
@@ -273,6 +262,7 @@ def legacy_get_flights(
                 "on_ground":            p.on_ground,
                 "squawk":               p.squawk,
                 "region_key":           p.region_key,
+                "data_source":          p.data_source,  # <--- FIX: Expose data source
                 "last_seen":            int(p.last_updated.timestamp()) if p.last_updated else None,
             }
             for p in positions
@@ -299,25 +289,25 @@ def _session_to_dict(s, detail: bool = False) -> dict:
         "max_altitude_m":    s.max_altitude_m,
         "total_distance_km": s.total_distance_km,
         "aircraft": {
-            "id":           s.aircraft.id,           # ADDED FIX: Required by Pydantic
+            "id":           s.aircraft.id,
             "icao24":       s.aircraft.icao24       if s.aircraft else None,
             "registration": s.aircraft.registration if s.aircraft else None,
             "type_code":    s.aircraft.type_code    if s.aircraft else None,
             "model":        s.aircraft.model        if s.aircraft else None,
         } if s.aircraft else None,
         "operator": {
-            "id":        s.operator.id,              # ADDED FIX: Required by Pydantic
+            "id":        s.operator.id,
             "icao_code": s.operator.icao_code if s.operator else None,
             "name":      s.operator.name      if s.operator else None,
         } if s.operator else None,
         "dep_airport": {
-            "id":        s.dep_airport.id,           # ADDED FIX: Required by Pydantic
+            "id":        s.dep_airport.id,
             "icao_code": s.dep_airport.icao_code if s.dep_airport else None,
             "iata_code": s.dep_airport.iata_code if s.dep_airport else None,
             "name":      s.dep_airport.name      if s.dep_airport else None,
         } if s.dep_airport else None,
         "arr_airport": {
-            "id":        s.arr_airport.id,           # ADDED FIX: Required by Pydantic
+            "id":        s.arr_airport.id,
             "icao_code": s.arr_airport.icao_code if s.arr_airport else None,
             "iata_code": s.arr_airport.iata_code if s.arr_airport else None,
             "name":      s.arr_airport.name      if s.arr_airport else None,
