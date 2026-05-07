@@ -1,12 +1,10 @@
 """
-Enterprise Pydantic Schemas (v3.2 — Multi-Source Ready + Backward Compatible)
+Enterprise Pydantic Schemas (v3.4 — Multi-Source Ready + Fix)
 Strict validation and typing for the Snowflake Architecture.
 
-CHANGES FROM v3.1:
-  RawIngestionPayload     → +data_source
-  LivePositionResponse    → +data_source
-  LivePositionsResponse   → kept for backward compatibility (but marked)
-  HistoryQueryResponse    → uses FlightSearchItem for performance (added missing model)
+CHANGES FROM v3.3:
+  Restored missing `FlightSearchItem` and `FlightSearchResponse` definitions
+  which caused a NameError on startup.
 """
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional, List, Any, Dict
@@ -70,7 +68,7 @@ class TrackTelemetryBase(BaseModel):
     vspeed_fpm:   Optional[float] = None
     is_on_ground: Optional[bool]  = False
     squawk:       Optional[str]   = None
-    data_source:  Optional[str]   = None   # NEW in v3.2
+    data_source:  Optional[str]   = None
 
 class TrackTelemetryResponse(TrackTelemetryBase):
     model_config = ConfigDict(from_attributes=True)
@@ -130,15 +128,7 @@ class LivePositionResponse(BaseModel):
     region_key:    Optional[str]   = None
     last_updated:  Optional[datetime] = None
     session_id:    Optional[int]   = None
-    data_source:   Optional[str]   = None   # NEW in v3.2
-
-
-# ── Backward Compatible Wrapper (kept for existing imports) ────────────────
-class LivePositionsResponse(BaseModel):
-    """Wrapper for live positions list (backward compatibility with v3.1)"""
-    total: int
-    active: int
-    data: List[LivePositionResponse]
+    data_source:   Optional[str]   = None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -153,7 +143,7 @@ class TrajectoryPoint(BaseModel):
     vel: Optional[float] = None
     hdg: Optional[float] = None
     vspd: Optional[float] = None
-    src: Optional[str] = None   # NEW in v3.2
+    src: Optional[str] = None
 
 class TrajectoryResponse(BaseModel):
     session_id: int
@@ -184,40 +174,15 @@ class FlightDetailResponse(BaseModel):
 
     trajectory:  Optional[TrajectoryResponse]   = None
 
+# ── FIX ADDED HERE: Restored missing search schemas ──
+FlightSearchItem = FlightDetailResponse
 
-# ═════════════════════════════════════════════════════════════════════════════
-# 4.5 FLIGHT SEARCH ITEM (Lightweight for history queries)
-# ═════════════════════════════════════════════════════════════════════════════
-
-class FlightSearchItem(BaseModel):
-    """Lightweight version for history queries (does NOT include tracks)"""
-    model_config = ConfigDict(from_attributes=True)
-
-    session_id: int
-    fr24_id: Optional[str] = None
-    flight_number: Optional[str] = None
-    callsign: Optional[str] = None
-    flight_status: Optional[str] = None
-    first_seen_ts: datetime
-    last_seen_ts: datetime
-
-    dep_airport_icao: Optional[str] = None
-    dep_airport_iata: Optional[str] = None
-    dep_airport_name: Optional[str] = None
-    arr_airport_icao: Optional[str] = None
-    arr_airport_iata: Optional[str] = None
-    arr_airport_name: Optional[str] = None
-
-    aircraft_icao24: Optional[str] = None
-    aircraft_type: Optional[str] = None
-    aircraft_model: Optional[str] = None
-
-    operator_icao: Optional[str] = None
-    operator_name: Optional[str] = None
-
-    max_altitude_m: Optional[float] = None
-    total_distance_km: Optional[float] = None
-    duration_seconds: Optional[int] = None
+class FlightSearchResponse(BaseModel):
+    total:     int
+    page:      int
+    page_size: int
+    pages:     int
+    data:      List[FlightSearchItem]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -246,7 +211,7 @@ class RawIngestionPayload(BaseModel):
     est_arrival_airport:   Optional[str] = None
     region_key:    Optional[str]   = "global"
     squawk:        Optional[str]   = None
-    data_source:   Optional[str]   = None   # NEW in v3.2
+    data_source:   Optional[str]   = None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -350,7 +315,7 @@ class HistoryQueryResponse(BaseModel):
     page:         int
     page_size:    int
     pages:        int
-    data:         List[FlightSearchItem]   # ✅ Now uses lightweight item
+    data:         List[FlightSearchItem]
     aggregations: Optional[HistoryAggregations] = None
 
 
@@ -375,7 +340,7 @@ class HealthCheck(BaseModel):
     status:    str
     timestamp: datetime
     database:  str
-    version:   str = "3.3.0-MultiSource"
+    version:   str = "3.4.0-MultiSource"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
