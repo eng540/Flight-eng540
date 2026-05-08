@@ -1,15 +1,19 @@
 """
-Enterprise CRUD Operations (v5.1 — Multi-Source Tagging Fixed)
+Enterprise CRUD Operations (v6.0 — Distributed Write-Safe & Concurrency Optimized)
 Compliant with Aviation Physics, State Machines, and FR24 OpenAPI spec.
 
-CHANGES FROM v5.0:
+CHANGES FROM v5.1:
   [FIX] EnterpriseDataRouter.process_telemetry_batch:
-        Now correctly extracts `payload.data_source` and saves it to both
-        `TrackTelemetry` and `CurrentAircraftState` models.
-        Evidence: Prevents silent data loss of the multi-source tracking feature.
+        - Implemented Atomic Upsert (ON CONFLICT DO UPDATE) for CurrentAircraftState.
+        - Implemented Lexicographical Sorting to mathematically prevent Deadlocks.
+        - Implemented Micro-batching with Savepoints (begin_nested) for failure-safe ingestion.
+        - Implemented Timestamp-based LWW and Source Priority conflict resolution.
+        - Eliminated N+1 queries via Bulk Pre-fetching.
 """
 from sqlalchemy.orm import Session, joinedload, aliased
 from sqlalchemy import func, and_, or_, desc, case
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, timezone, timedelta
 import logging
@@ -103,82 +107,85 @@ class EnterpriseDataRouter:
             "tracks_recorded": 0, "events": 0,
             "rejected": 0, "errors": 0,
         }
+        if not payloads:
+            return stats
 
-        # ── Step 1: Pre-resolve FK dimensions ────────────────────────────────
+        # ── Step 1: Bulk Pre-fetch & Cache (Eliminate N+1) ───────────────────
+        icao24s = list({p.icao24 for p in payloads})
+        
+        # Pre-fetch Current States for Validation
+        current_states = {
+            s.icao24: s for s in db.query(models.CurrentAircraftState)
+            .filter(models.CurrentAircraftState.icao24.in_(icao24s)).all()
+        }
+
+        # Pre-fetch Aircraft
+        aircraft_cache = {
+            a.icao24: a for a in db.query(models.DimAircraft)
+            .filter(models.DimAircraft.icao24.in_(icao24s), models.DimAircraft.valid_to.is_(None)).all()
+        }
+
+        # Pre-fetch Active Sessions
+        active_sessions = {
+            s.aircraft.icao24: s for s in db.query(models.FactFlightSession)
+            .join(models.DimAircraft)
+            .filter(
+                models.DimAircraft.icao24.in_(icao24s),
+                models.FactFlightSession.flight_status == "active"
+            ).all()
+        }
+
         geo_cache: Dict[str, int] = {}
-        operator_cache: Dict[str, Dict[str, Any]] = {}   # {icao: {"id":, "name":}}
+        operator_cache: Dict[str, Dict[str, Any]] = {}
 
-        for p in payloads:
-            if p.est_departure_airport:
-                EnterpriseDataRouter._ensure_geo(db, geo_cache, p.est_departure_airport)
-            if p.est_arrival_airport:
-                EnterpriseDataRouter._ensure_geo(db, geo_cache, p.est_arrival_airport)
-            if p.operator_icao:
-                EnterpriseDataRouter._ensure_operator(db, operator_cache, p.operator_icao)
-        db.commit()
-
-        # ── Step 2: Process each radar ping ───────────────────────────────────
-        aircraft_cache: Dict[str, models.DimAircraft] = {}
+        # ── Step 2: Process each radar ping (In-Memory) ───────────────────────
+        valid_payloads = []
+        state_upsert_dicts = []
 
         for payload in payloads:
             try:
-                current_state = (
-                    db.query(models.CurrentAircraftState)
-                    .filter(models.CurrentAircraftState.icao24 == payload.icao24)
-                    .first()
-                )
+                current_state = current_states.get(payload.icao24)
 
                 if not DataQualityValidator.validate_physics(payload, current_state):
                     stats["rejected"] += 1
                     continue
 
-                dep_id = geo_cache.get(payload.est_departure_airport.upper()) if payload.est_departure_airport else None
-                arr_id = geo_cache.get(payload.est_arrival_airport.upper())   if payload.est_arrival_airport   else None
-
-                op_entry = operator_cache.get(payload.operator_icao.upper()) if payload.operator_icao else None
+                # Resolve Dimensions (with failure-safe nested transactions)
+                dep_id = EnterpriseDataRouter._ensure_geo_safe(db, geo_cache, payload.est_departure_airport)
+                arr_id = EnterpriseDataRouter._ensure_geo_safe(db, geo_cache, payload.est_arrival_airport)
+                op_entry = EnterpriseDataRouter._ensure_operator_safe(db, operator_cache, payload.operator_icao)
+                
                 op_id    = op_entry["id"]   if op_entry else None
                 op_name  = op_entry["name"] if op_entry else None
 
-                # ── Aircraft (SCD Type 2) ──────────────────────────────────
+                # Aircraft Resolution
                 aircraft = aircraft_cache.get(payload.icao24)
                 if not aircraft:
-                    aircraft = (
-                        db.query(models.DimAircraft)
-                        .filter(
-                            models.DimAircraft.icao24 == payload.icao24,
-                            models.DimAircraft.valid_to.is_(None),
-                        )
-                        .first()
-                    )
-                    if not aircraft:
-                        aircraft = models.DimAircraft(
-                            icao24=payload.icao24,
-                            registration=payload.registration,
-                            type_code=payload.aircraft_type,
-                            country_code=(
-                                payload.origin_country[:2].upper()
-                                if payload.origin_country else None
-                            ),
-                            operator_id=op_id,
-                        )
-                        db.add(aircraft)
-                        db.flush()
-                        stats["new_aircrafts"] += 1
-                    aircraft_cache[payload.icao24] = aircraft
+                    try:
+                        with db.begin_nested():
+                            aircraft = models.DimAircraft(
+                                icao24=payload.icao24,
+                                registration=payload.registration,
+                                type_code=payload.aircraft_type,
+                                country_code=(payload.origin_country[:2].upper() if payload.origin_country else None),
+                                operator_id=op_id,
+                            )
+                            db.add(aircraft)
+                            db.flush()
+                            stats["new_aircrafts"] += 1
+                            aircraft_cache[payload.icao24] = aircraft
+                    except IntegrityError:
+                        # Handled concurrent insert by another worker
+                        aircraft = db.query(models.DimAircraft).filter_by(icao24=payload.icao24, valid_to=None).first()
+                        aircraft_cache[payload.icao24] = aircraft
+
+                if not aircraft:
+                    continue # Skip if resolution completely failed
 
                 dt_timestamp = datetime.fromtimestamp(payload.timestamp, tz=timezone.utc)
 
-                # ── Session State Machine ──────────────────────────────────
-                session = (
-                    db.query(models.FactFlightSession)
-                    .filter(
-                        models.FactFlightSession.aircraft_id == aircraft.id,
-                        models.FactFlightSession.flight_status == "active",
-                    )
-                    .order_by(desc(models.FactFlightSession.last_seen_ts))
-                    .first()
-                )
-
+                # Session State Machine
+                session = active_sessions.get(payload.icao24)
                 last_on_ground  = current_state.on_ground if current_state else payload.on_ground
                 is_moving       = payload.velocity and payload.velocity > 50
                 should_open     = False
@@ -201,9 +208,7 @@ class EnterpriseDataRouter:
 
                     if should_close:
                         session.flight_status    = close_reason
-                        session.actual_landing_ts = (
-                            session.last_seen_ts if close_reason == "landed" else None
-                        )
+                        session.actual_landing_ts = session.last_seen_ts if close_reason == "landed" else None
                         db.flush()
                         if close_reason == "lost_signal":
                             db.add(models.FactAviationEvent(
@@ -212,14 +217,16 @@ class EnterpriseDataRouter:
                                 event_category="SYSTEM", event_type="SIGNAL_LOST",
                             ))
                             stats["events"] += 1
+                        
+                        del active_sessions[payload.icao24] # Remove from active cache
+                        
                         if not payload.on_ground or is_moving:
                             should_open = True
 
                 if should_open:
                     session = models.FactFlightSession(
                         aircraft_id=aircraft.id, operator_id=op_id,
-                        callsign=payload.callsign,
-                        fr24_id=payload.fr24_id,
+                        callsign=payload.callsign, fr24_id=payload.fr24_id,
                         flight_number=payload.flight_number,
                         dep_airport_id=dep_id, arr_airport_id=arr_id,
                         first_seen_ts=dt_timestamp, last_seen_ts=dt_timestamp,
@@ -227,7 +234,9 @@ class EnterpriseDataRouter:
                     )
                     db.add(session)
                     db.flush()
+                    active_sessions[payload.icao24] = session
                     stats["new_sessions"] += 1
+                    
                     if not payload.on_ground:
                         db.add(models.FactAviationEvent(
                             timestamp=dt_timestamp, aircraft_id=aircraft.id,
@@ -236,115 +245,178 @@ class EnterpriseDataRouter:
                         ))
                         stats["events"] += 1
 
-                # ── Update active session ──────────────────────────────────
+                # Update active session & Add Track
                 if session and session.flight_status == "active":
                     session.last_seen_ts = dt_timestamp
-                    if payload.altitude and (
-                        session.max_altitude_m is None
-                        or payload.altitude > session.max_altitude_m
-                    ):
+                    if payload.altitude and (session.max_altitude_m is None or payload.altitude > session.max_altitude_m):
                         session.max_altitude_m = payload.altitude
 
-                    if payload.fr24_id     and not session.fr24_id:      session.fr24_id      = payload.fr24_id
+                    if payload.fr24_id and not session.fr24_id: session.fr24_id = payload.fr24_id
                     if payload.flight_number and not session.flight_number: session.flight_number = payload.flight_number
                     if dep_id and not session.dep_airport_id: session.dep_airport_id = dep_id
                     if arr_id and not session.arr_airport_id: session.arr_airport_id = arr_id
-                    if op_id  and not session.operator_id:    session.operator_id    = op_id
+                    if op_id  and not session.operator_id: session.operator_id = op_id
 
                     db.add(models.TrackTelemetry(
-                        timestamp=dt_timestamp,
-                        session_id=session.session_id,
+                        timestamp=dt_timestamp, session_id=session.session_id,
                         latitude=payload.latitude, longitude=payload.longitude,
                         altitude_m=payload.altitude, velocity_kmh=payload.velocity,
                         heading_deg=payload.heading, vspeed_fpm=payload.vspeed_fpm,
                         is_on_ground=payload.on_ground, squawk=payload.squawk,
-                        data_source=payload.data_source,  # <--- FIX: Tagging source
+                        data_source=payload.data_source,
                     ))
                     stats["tracks_recorded"] += 1
 
-                # ── Emergency squawk ───────────────────────────────────────
+                # Emergency squawk
                 if payload.squawk in ("7500", "7600", "7700"):
                     last_sq = current_state.squawk if current_state else None
                     if payload.squawk != last_sq and session:
                         db.add(models.FactAviationEvent(
                             timestamp=dt_timestamp, aircraft_id=aircraft.id,
                             session_id=session.session_id,
-                            event_category="EMERGENCY",
-                            event_type=f"SQUAWK_{payload.squawk}",
+                            event_category="EMERGENCY", event_type=f"SQUAWK_{payload.squawk}",
                         ))
                         stats["events"] += 1
 
-                # ── Update UI cache ────────────────────────────────────────
-                if not current_state:
-                    current_state = models.CurrentAircraftState(icao24=payload.icao24)
-                    db.add(current_state)
-
-                current_state.aircraft_id    = aircraft.id
-                current_state.session_id     = session.session_id if session else None
-                current_state.callsign       = payload.callsign
-                current_state.fr24_id        = payload.fr24_id
-                current_state.flight_number  = payload.flight_number
-                current_state.aircraft_type  = payload.aircraft_type
-                current_state.vspeed_fpm     = payload.vspeed_fpm
-                current_state.region_key     = payload.region_key
-                current_state.operator_name  = op_name
-                current_state.aircraft_model = aircraft.model
-                current_state.dep_airport_iata = payload.est_departure_airport
-                current_state.arr_airport_iata = payload.est_arrival_airport
-                current_state.latitude       = payload.latitude
-                current_state.longitude      = payload.longitude
-                current_state.altitude_m     = payload.altitude
-                current_state.velocity_kmh   = payload.velocity
-                current_state.heading_deg    = payload.heading
-                current_state.on_ground      = payload.on_ground
-                current_state.squawk         = payload.squawk
-                current_state.data_source    = payload.data_source  # <--- FIX: Tagging source
-                current_state.last_updated   = dt_timestamp
+                # Prepare dict for Atomic Upsert
+                state_upsert_dicts.append({
+                    "icao24": payload.icao24,
+                    "aircraft_id": aircraft.id,
+                    "session_id": session.session_id if session else None,
+                    "fr24_id": payload.fr24_id,
+                    "callsign": payload.callsign,
+                    "flight_number": payload.flight_number,
+                    "operator_name": op_name,
+                    "aircraft_type": payload.aircraft_type,
+                    "aircraft_model": aircraft.model,
+                    "dep_airport_iata": payload.est_departure_airport,
+                    "arr_airport_iata": payload.est_arrival_airport,
+                    "latitude": payload.latitude,
+                    "longitude": payload.longitude,
+                    "altitude_m": payload.altitude,
+                    "velocity_kmh": payload.velocity,
+                    "heading_deg": payload.heading,
+                    "vspeed_fpm": payload.vspeed_fpm,
+                    "on_ground": payload.on_ground,
+                    "squawk": payload.squawk,
+                    "region_key": payload.region_key,
+                    "data_source": payload.data_source,
+                    "last_updated": dt_timestamp
+                })
 
             except Exception as exc:
-                logger.error(f"[Router] Error on {payload.icao24}: {exc}", exc_info=True)
-                db.rollback()
+                logger.error(f"[Router] Error processing {payload.icao24}: {exc}", exc_info=True)
                 stats["errors"] += 1
+
+        # Flush Sessions and Tracks before Upserting State
+        try:
+            db.flush()
+        except Exception as exc:
+            logger.error(f"[Router] Pre-upsert flush failed: {exc}")
+            db.rollback()
+            return stats
+
+        # ── Step 3: Atomic Upsert for CurrentAircraftState ───────────────────
+        if state_upsert_dicts:
+            # 1. Lexicographical Sorting (Prevents Deadlocks)
+            state_upsert_dicts.sort(key=lambda x: x["icao24"])
+
+            # 2. Micro-batching
+            batch_size = 50
+            for i in range(0, len(state_upsert_dicts), batch_size):
+                batch = state_upsert_dicts[i:i+batch_size]
+                
+                stmt = pg_insert(models.CurrentAircraftState).values(batch)
+                
+                # 3. Source Priority Logic (FR24 > AIRLABS > OPENSKY)
+                priority_sql = case(
+                    (stmt.excluded.data_source == 'FR24', 3),
+                    (stmt.excluded.data_source == 'AIRLABS', 2),
+                    (stmt.excluded.data_source == 'OPENSKY', 1),
+                    else_=0
+                )
+                current_priority_sql = case(
+                    (models.CurrentAircraftState.data_source == 'FR24', 3),
+                    (models.CurrentAircraftState.data_source == 'AIRLABS', 2),
+                    (models.CurrentAircraftState.data_source == 'OPENSKY', 1),
+                    else_=0
+                )
+
+                update_dict = {c.name: c for c in stmt.excluded if c.name != 'icao24'}
+
+                # 4. Timestamp-based conflict resolution & Stale write protection
+                update_stmt = stmt.on_conflict_do_update(
+                    index_elements=['icao24'],
+                    set_=update_dict,
+                    where=or_(
+                        stmt.excluded.last_updated > models.CurrentAircraftState.last_updated,
+                        and_(
+                            stmt.excluded.last_updated == models.CurrentAircraftState.last_updated,
+                            priority_sql > current_priority_sql
+                        )
+                    )
+                )
+
+                # 5. Failure-safe execution
+                try:
+                    with db.begin_nested():
+                        db.execute(update_stmt)
+                except Exception as exc:
+                    logger.error(f"[Router] Atomic Upsert batch failed: {exc}")
+                    stats["errors"] += len(batch)
 
         try:
             db.commit()
         except Exception as exc:
-            logger.error(f"[Router] Batch commit failed: {exc}", exc_info=True)
+            logger.error(f"[Router] Final commit failed: {exc}", exc_info=True)
             db.rollback()
             stats["errors"] += 1
 
         return stats
 
-    # ── FK helpers ─────────────────────────────────────────────────────────
+    # ── Safe FK helpers (Handles Concurrent Inserts) ───────────────────────
 
     @staticmethod
-    def _ensure_geo(db: Session, cache: Dict[str, int], icao: str) -> None:
+    def _ensure_geo_safe(db: Session, cache: Dict[str, int], icao: Optional[str]) -> Optional[int]:
+        if not icao: return None
         key = icao.upper()
-        if key in cache:
-            return
-        geo = db.query(models.DimGeography).filter(
-            models.DimGeography.icao_code == key
-        ).first()
+        if key in cache: return cache[key]
+        
+        geo = db.query(models.DimGeography).filter_by(icao_code=key).first()
         if not geo:
-            geo = models.DimGeography(icao_code=key, name=f"Airport {key}")
-            db.add(geo)
-            db.flush()
-        cache[key] = geo.id
+            try:
+                with db.begin_nested():
+                    geo = models.DimGeography(icao_code=key, name=f"Airport {key}")
+                    db.add(geo)
+                    db.flush()
+            except IntegrityError:
+                geo = db.query(models.DimGeography).filter_by(icao_code=key).first()
+        
+        if geo:
+            cache[key] = geo.id
+            return geo.id
+        return None
 
     @staticmethod
-    def _ensure_operator(db: Session,
-                         cache: Dict[str, Dict[str, Any]], icao: str) -> None:
+    def _ensure_operator_safe(db: Session, cache: Dict[str, Dict[str, Any]], icao: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not icao: return None
         key = icao.upper()
-        if key in cache:
-            return
-        op = db.query(models.DimOperator).filter(
-            models.DimOperator.icao_code == key
-        ).first()
+        if key in cache: return cache[key]
+        
+        op = db.query(models.DimOperator).filter_by(icao_code=key).first()
         if not op:
-            op = models.DimOperator(icao_code=key, name=f"Operator {key}")
-            db.add(op)
-            db.flush()
-        cache[key] = {"id": op.id, "name": op.name}
+            try:
+                with db.begin_nested():
+                    op = models.DimOperator(icao_code=key, name=f"Operator {key}")
+                    db.add(op)
+                    db.flush()
+            except IntegrityError:
+                op = db.query(models.DimOperator).filter_by(icao_code=key).first()
+                
+        if op:
+            cache[key] = {"id": op.id, "name": op.name}
+            return cache[key]
+        return None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
