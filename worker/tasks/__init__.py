@@ -1,12 +1,11 @@
 """
-Celery Tasks — Flight Intelligence Worker (v3.1 — Time Limits Tuned)
+Celery Tasks — Flight Intelligence Worker (v4.0 — Distributed Locking)
 All task definitions match beat_schedule entries exactly.
 
-UPGRADES FROM v3.0:
-  [FIX] Increased `soft_time_limit` and `time_limit` for live ingestion tasks
-        (OpenSky, AirLabs, FR24) from 300s to 600s.
-        Evidence: Logs showed `SoftTimeLimitExceeded` for AirLabs task after 5 mins,
-        preventing it from completing the multi-region sweep.
+UPGRADES FROM v3.1:
+  [FIX] Introduced Redis Distributed Locks (`acquire_lock`) to prevent Task Pile-up.
+        If a task (e.g., OpenSky) is already running and takes longer than its schedule,
+        the next triggered instance will instantly skip execution, preventing DB Deadlocks.
 """
 from . import operations_task
 from celery import shared_task
@@ -16,7 +15,9 @@ import sys
 import os
 import time
 from typing import List, Optional
+from contextlib import contextmanager
 
+import redis
 from sqlalchemy import create_engine, inspect
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
@@ -26,9 +27,33 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# INTERNAL: Redis Distributed Lock Manager
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Initialize a single Redis client for the worker process
+redis_client = redis.from_url(settings.REDIS_URL)
+
+@contextmanager
+def acquire_lock(lock_name: str, timeout: int = 600):
+    """
+    Context manager for acquiring a non-blocking Redis lock.
+    Timeout ensures the lock is released eventually if the worker crashes.
+    """
+    lock = redis_client.lock(lock_name, timeout=timeout)
+    acquired = lock.acquire(blocking=False)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                lock.release()
+            except redis.exceptions.LockError:
+                # Lock might have expired naturally due to timeout, safe to ignore
+                pass
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INTERNAL: DB readiness guard — shared by tasks that need live tables
+# INTERNAL: DB readiness guard
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _wait_for_db(max_attempts: int = 30, sleep_s: float = 2.0) -> bool:
@@ -38,7 +63,6 @@ def _wait_for_db(max_attempts: int = 30, sleep_s: float = 2.0) -> bool:
     for attempt in range(max_attempts):
         try:
             if "dim_geography" in inspector.get_table_names():
-                logger.info("[DB Guard] Tables ready.")
                 return True
         except Exception:
             pass
@@ -49,118 +73,136 @@ def _wait_for_db(max_attempts: int = 30, sleep_s: float = 2.0) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TASK 1: OPENSKY LIVE INGESTION (Primary Free Source - High Frequency)
+# TASK 1: OPENSKY LIVE INGESTION
 # ─────────────────────────────────────────────────────────────────────────────
 
 @shared_task(
     bind=True, max_retries=1, default_retry_delay=30,
-    soft_time_limit=600, time_limit=700,  # <--- FIX: Increased time limit
+    soft_time_limit=600, time_limit=700,
     name="worker.tasks.ingest_live_opensky_task",
     queue="ingestion",
 )
 def ingest_live_opensky_task(self, region_keys: Optional[List[str]] = None):
-    if not _wait_for_db():
-        return {"status": "error", "message": "DB tables not ready"}
+    # 🚨 DISTRIBUTED LOCK: Prevent overlapping executions
+    with acquire_lock("lock:ingestion:opensky", timeout=600) as acquired:
+        if not acquired:
+            logger.info("[OpenSky Task] Already running. Skipping to prevent overlap.")
+            return {"status": "skipped", "reason": "already_running"}
 
-    try:
-        active_keys = region_keys or settings.get_active_region_keys()
-        regions = [r for r in (settings.get_region(k) for k in active_keys) if r]
+        if not _wait_for_db():
+            return {"status": "error", "message": "DB tables not ready"}
 
-        if not regions:
-            return {"status": "skipped", "reason": "no regions"}
-
-        svc = FlightIngestionService()
-        logger.info(f"[OpenSky Task] Starting live sweep: {[r.key for r in regions]}")
-        result = svc.ingest_live_radar_from_opensky(regions)
-        return {"status": "success", "result": result}
-
-    except SoftTimeLimitExceeded:
-        logger.warning("[OpenSky Task] Soft time limit exceeded.")
-        return {"status": "timeout"}
-    except Exception as exc:
-        logger.error(f"[OpenSky Task] Failed: {exc}", exc_info=True)
         try:
-            self.retry(exc=exc)
-        except MaxRetriesExceededError:
-            return {"status": "failed", "error": str(exc)}
+            active_keys = region_keys or settings.get_active_region_keys()
+            regions = [r for r in (settings.get_region(k) for k in active_keys) if r]
+
+            if not regions:
+                return {"status": "skipped", "reason": "no regions"}
+
+            svc = FlightIngestionService()
+            logger.info(f"[OpenSky Task] Starting live sweep: {[r.key for r in regions]}")
+            result = svc.ingest_live_radar_from_opensky(regions)
+            return {"status": "success", "result": result}
+
+        except SoftTimeLimitExceeded:
+            logger.warning("[OpenSky Task] Soft time limit exceeded.")
+            return {"status": "timeout"}
+        except Exception as exc:
+            logger.error(f"[OpenSky Task] Failed: {exc}", exc_info=True)
+            try:
+                self.retry(exc=exc)
+            except MaxRetriesExceededError:
+                return {"status": "failed", "error": str(exc)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TASK 2: AIRLABS LIVE INGESTION (Secondary Free Source - Low Frequency)
+# TASK 2: AIRLABS LIVE INGESTION
 # ─────────────────────────────────────────────────────────────────────────────
 
 @shared_task(
     bind=True, max_retries=1, default_retry_delay=60,
-    soft_time_limit=600, time_limit=700,  # <--- FIX: Increased time limit
+    soft_time_limit=600, time_limit=700,
     name="worker.tasks.ingest_live_airlabs_task",
     queue="ingestion",
 )
 def ingest_live_airlabs_task(self, region_keys: Optional[List[str]] = None):
-    if not _wait_for_db():
-        return {"status": "error", "message": "DB tables not ready"}
+    # 🚨 DISTRIBUTED LOCK: Prevent overlapping executions
+    with acquire_lock("lock:ingestion:airlabs", timeout=600) as acquired:
+        if not acquired:
+            logger.info("[AirLabs Task] Already running. Skipping to prevent overlap.")
+            return {"status": "skipped", "reason": "already_running"}
 
-    try:
-        active_keys = region_keys or settings.get_active_region_keys()
-        regions = [r for r in (settings.get_region(k) for k in active_keys) if r]
+        if not _wait_for_db():
+            return {"status": "error", "message": "DB tables not ready"}
 
-        if not regions:
-            return {"status": "skipped", "reason": "no regions"}
-
-        svc = FlightIngestionService()
-        logger.info(f"[AirLabs Task] Starting live sweep: {[r.key for r in regions]}")
-        result = svc.ingest_live_radar_from_airlabs(regions)
-        return {"status": "success", "result": result}
-
-    except SoftTimeLimitExceeded:
-        logger.warning("[AirLabs Task] Soft time limit exceeded.")
-        return {"status": "timeout"}
-    except Exception as exc:
-        logger.error(f"[AirLabs Task] Failed: {exc}", exc_info=True)
         try:
-            self.retry(exc=exc)
-        except MaxRetriesExceededError:
-            return {"status": "failed", "error": str(exc)}
+            active_keys = region_keys or settings.get_active_region_keys()
+            regions = [r for r in (settings.get_region(k) for k in active_keys) if r]
+
+            if not regions:
+                return {"status": "skipped", "reason": "no regions"}
+
+            svc = FlightIngestionService()
+            logger.info(f"[AirLabs Task] Starting live sweep: {[r.key for r in regions]}")
+            result = svc.ingest_live_radar_from_airlabs(regions)
+            return {"status": "success", "result": result}
+
+        except SoftTimeLimitExceeded:
+            logger.warning("[AirLabs Task] Soft time limit exceeded.")
+            return {"status": "timeout"}
+        except Exception as exc:
+            logger.error(f"[AirLabs Task] Failed: {exc}", exc_info=True)
+            try:
+                self.retry(exc=exc)
+            except MaxRetriesExceededError:
+                return {"status": "failed", "error": str(exc)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TASK 3: FR24 LIVE INGESTION (Fallback/Premium Source - Low Frequency)
+# TASK 3: FR24 LIVE INGESTION
 # ─────────────────────────────────────────────────────────────────────────────
 
 @shared_task(
     bind=True, max_retries=1, default_retry_delay=60,
-    soft_time_limit=600, time_limit=700,  # <--- FIX: Increased time limit
+    soft_time_limit=600, time_limit=700,
     name="worker.tasks.ingest_live_fr24_task",
     queue="ingestion",
 )
 def ingest_live_fr24_task(self, region_keys: Optional[List[str]] = None):
-    if not _wait_for_db():
-        return {"status": "error", "message": "DB tables not ready"}
+    # 🚨 DISTRIBUTED LOCK: Prevent overlapping executions
+    with acquire_lock("lock:ingestion:fr24", timeout=600) as acquired:
+        if not acquired:
+            logger.info("[FR24 Task] Already running. Skipping to prevent overlap.")
+            return {"status": "skipped", "reason": "already_running"}
 
-    try:
-        active_keys = region_keys or settings.get_active_region_keys()
-        regions = [r for r in (settings.get_region(k) for k in active_keys) if r]
+        if not _wait_for_db():
+            return {"status": "error", "message": "DB tables not ready"}
 
-        if not regions:
-            return {"status": "skipped", "reason": "no regions"}
-
-        svc = FlightIngestionService()
-        logger.info(f"[FR24 Task] Starting live sweep: {[r.key for r in regions]}")
-        result = svc.ingest_live_radar_from_fr24(regions)
-        return {"status": "success", "result": result}
-
-    except SoftTimeLimitExceeded:
-        logger.warning("[FR24 Task] Soft time limit exceeded.")
-        return {"status": "timeout"}
-    except Exception as exc:
-        logger.error(f"[FR24 Task] Failed: {exc}", exc_info=True)
         try:
-            self.retry(exc=exc)
-        except MaxRetriesExceededError:
-            return {"status": "failed", "error": str(exc)}
+            active_keys = region_keys or settings.get_active_region_keys()
+            regions = [r for r in (settings.get_region(k) for k in active_keys) if r]
+
+            if not regions:
+                return {"status": "skipped", "reason": "no regions"}
+
+            svc = FlightIngestionService()
+            logger.info(f"[FR24 Task] Starting live sweep: {[r.key for r in regions]}")
+            result = svc.ingest_live_radar_from_fr24(regions)
+            return {"status": "success", "result": result}
+
+        except SoftTimeLimitExceeded:
+            logger.warning("[FR24 Task] Soft time limit exceeded.")
+            return {"status": "timeout"}
+        except Exception as exc:
+            logger.error(f"[FR24 Task] Failed: {exc}", exc_info=True)
+            try:
+                self.retry(exc=exc)
+            except MaxRetriesExceededError:
+                return {"status": "failed", "error": str(exc)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TASK 4: Historical ingestion (on-demand, chunked, idempotent)
+# TASK 4: Historical ingestion
 # ─────────────────────────────────────────────────────────────────────────────
 
 @shared_task(
@@ -256,7 +298,7 @@ def cleanup_old_data_task(self, days: int = 0):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TASK 6: Enrichment (on-demand — called after historical ingestion)
+# TASK 6: Enrichment
 # ─────────────────────────────────────────────────────────────────────────────
 
 @shared_task(
@@ -282,7 +324,7 @@ def enrich_flight_details_task(self, fr24_ids: List[str]):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LEGACY STUBS — prevents "unregistered task" errors in beat logs
+# LEGACY STUBS
 # ─────────────────────────────────────────────────────────────────────────────
 
 @shared_task(bind=True, name="worker.tasks.run_realtime_radar_task", queue="ingestion")
@@ -295,8 +337,8 @@ def ingest_aviationstack_task(self):
 
 @shared_task(bind=True, name="worker.tasks.ingest_recent_geo_task", queue="ingestion")
 def ingest_recent_geo_task(self, *args, **kwargs):
-    return {"status": "skipped", "reason": "deprecated — replaced by multi-source tasks"}
+    return {"status": "skipped", "reason": "deprecated"}
 
 @shared_task(bind=True, name="worker.tasks.ingest_flights_task", queue="ingestion")
 def ingest_flights_task(self, *args, **kwargs):
-    return {"status": "skipped", "reason": "deprecated — replaced by multi-source tasks"}
+    return {"status": "skipped", "reason": "deprecated"}
