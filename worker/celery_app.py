@@ -1,10 +1,11 @@
 """
 Celery application – supports redis:// and rediss:// (Upstash/TLS).
-v3.0 — Multi-Source Hybrid Engine Configuration
+v3.2 — Multi-Source Hybrid Engine Configuration (with Startup Jitter)
 """
 import os
 import ssl
 import logging
+import random
 
 from celery import Celery
 from celery.signals import task_failure, task_success, worker_ready
@@ -116,23 +117,35 @@ def health_check_task(self):
 @worker_ready.connect
 def trigger_initial_ingestion(sender, **kwargs):
     """
-    SRE Fix: Trigger all live ingestion tasks immediately on startup.
-    This prevents the 'Silent Empty UI' issue while waiting for the schedules to tick.
+    SRE Fix: Trigger all live ingestion tasks on startup with Jitter.
+    This prevents the 'Silent Empty UI' issue while avoiding a 'Trigger Storm'
+    that causes DB Deadlocks and Connection Pool Exhaustion.
     """
-    logger.info("[SRE] Worker ready! Triggering initial multi-source ingestion...")
+    logger.info("[SRE] Worker ready! Triggering initial multi-source ingestion with Jitter...")
     
+    # 1. OpenSky starts immediately (Fastest, most likely to be blocked)
     sender.app.send_task(
         "worker.tasks.ingest_live_opensky_task",
         queue="ingestion"
     )
+    
+    # 2. AirLabs starts after a random delay of 5 to 15 seconds
+    airlabs_delay = random.uniform(5.0, 15.0)
     sender.app.send_task(
         "worker.tasks.ingest_live_airlabs_task",
-        queue="ingestion"
+        queue="ingestion",
+        countdown=airlabs_delay
     )
+    logger.info(f"[SRE] Scheduled AirLabs initial ingestion in {airlabs_delay:.1f}s")
+    
+    # 3. FR24 starts after a random delay of 15 to 30 seconds
+    fr24_delay = random.uniform(15.0, 30.0)
     sender.app.send_task(
         "worker.tasks.ingest_live_fr24_task",
-        queue="ingestion"
+        queue="ingestion",
+        countdown=fr24_delay
     )
+    logger.info(f"[SRE] Scheduled FR24 initial ingestion in {fr24_delay:.1f}s")
 
 
 if __name__ == "__main__":
