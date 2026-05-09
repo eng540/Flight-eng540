@@ -1,6 +1,6 @@
 """
 Celery application – supports redis:// and rediss:// (Upstash/TLS).
-v3.2 — Multi-Source Hybrid Engine Configuration (with Startup Jitter)
+v3.3 — Multi-Source Hybrid Engine Configuration (with Startup Jitter & Tuned Schedules)
 """
 import os
 import ssl
@@ -42,26 +42,29 @@ celery_app.conf.update(
     beat_schedule_filename="/tmp/celerybeat-schedule",
 
     beat_schedule={
-        # ── 1. OpenSky: Primary Free Source (Every 1 Minute) ──
+        # ── 1. OpenSky: Primary Free Source ──
+        # FIX: Increased from 60s to 300s (5 mins) to prevent Task Pile-up
+        # since the task itself can take ~150s to complete.
         "ingest-live-opensky": {
             "task": "worker.tasks.ingest_live_opensky_task",
-            "schedule": 60.0,
+            "schedule": 300.0,
         },
-        # ── 2. AirLabs: Secondary Free Source (Every 1 Hour) ──
+        # ── 2. AirLabs: Secondary Free Source ──
         "ingest-live-airlabs": {
             "task": "worker.tasks.ingest_live_airlabs_task",
             "schedule": 3600.0,
         },
-        # ── 3. FR24: Fallback/Premium Source (Every 1 Hour) ──
+        # ── 3. FR24: Fallback/Premium Source ──
         "ingest-live-fr24": {
             "task": "worker.tasks.ingest_live_fr24_task",
             "schedule": 3600.0,
         },
         
         # ── System Maintenance ──
+        # FIX: Increased from 30s to 3600s (1 hour) to reduce empty task spam.
         "retry-ops-chunks": {
             "task": "worker.tasks.operations_task.retry_chunks_task",
-            "schedule": 30.0,
+            "schedule": 3600.0,
             "options": {"queue": "maintenance"},
         },
         "cleanup-old-data-daily": {
@@ -129,8 +132,8 @@ def trigger_initial_ingestion(sender, **kwargs):
         queue="ingestion"
     )
     
-    # 2. AirLabs starts after a random delay of 5 to 15 seconds
-    airlabs_delay = random.uniform(5.0, 15.0)
+    # 2. AirLabs starts after a random delay of 15 to 30 seconds
+    airlabs_delay = random.uniform(15.0, 30.0)
     sender.app.send_task(
         "worker.tasks.ingest_live_airlabs_task",
         queue="ingestion",
@@ -138,8 +141,8 @@ def trigger_initial_ingestion(sender, **kwargs):
     )
     logger.info(f"[SRE] Scheduled AirLabs initial ingestion in {airlabs_delay:.1f}s")
     
-    # 3. FR24 starts after a random delay of 15 to 30 seconds
-    fr24_delay = random.uniform(15.0, 30.0)
+    # 3. FR24 starts after a random delay of 45 to 60 seconds
+    fr24_delay = random.uniform(45.0, 60.0)
     sender.app.send_task(
         "worker.tasks.ingest_live_fr24_task",
         queue="ingestion",
