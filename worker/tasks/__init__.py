@@ -1,10 +1,10 @@
 """
-Celery Tasks — Flight Intelligence Worker (v4.1 — Orphaned Session Sweeper Added)
+Celery Tasks — Flight Intelligence Worker (v4.3 — Telegram Restore Engine Added)
 All task definitions match beat_schedule entries exactly.
 
-UPGRADES FROM v4.0:
-  [NEW] Added `close_orphaned_sessions_task` to periodically close 'active' 
-        flight sessions that haven't received updates in 45 minutes.
+UPGRADES FROM v4.2:
+  [NEW] Added `restore_database_task` to download a backup file from Telegram,
+        terminate active DB connections, and restore the database using psql.
 """
 from . import operations_task
 from celery import shared_task
@@ -13,11 +13,15 @@ import logging
 import sys
 import os
 import time
+import subprocess
+import tempfile
+import requests
+from datetime import datetime, timezone
 from typing import List, Optional
 from contextlib import contextmanager
 
 import redis
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
 
@@ -32,15 +36,10 @@ logger = logging.getLogger(__name__)
 # INTERNAL: Redis Distributed Lock Manager
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Initialize a single Redis client for the worker process
 redis_client = redis.from_url(settings.REDIS_URL)
 
 @contextmanager
 def acquire_lock(lock_name: str, timeout: int = 600):
-    """
-    Context manager for acquiring a non-blocking Redis lock.
-    Timeout ensures the lock is released eventually if the worker crashes.
-    """
     lock = redis_client.lock(lock_name, timeout=timeout)
     acquired = lock.acquire(blocking=False)
     try:
@@ -50,7 +49,6 @@ def acquire_lock(lock_name: str, timeout: int = 600):
             try:
                 lock.release()
             except redis.exceptions.LockError:
-                # Lock might have expired naturally due to timeout, safe to ignore
                 pass
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -58,7 +56,6 @@ def acquire_lock(lock_name: str, timeout: int = 600):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _wait_for_db(max_attempts: int = 30, sleep_s: float = 2.0) -> bool:
-    """Returns True when 'dim_geography' table is present, False on timeout."""
     engine = create_engine(settings.DATABASE_URL)
     inspector = inspect(engine)
     for attempt in range(max_attempts):
@@ -72,6 +69,22 @@ def _wait_for_db(max_attempts: int = 30, sleep_s: float = 2.0) -> bool:
     logger.error("[DB Guard] Tables not ready after timeout. Aborting.")
     return False
 
+# ─────────────────────────────────────────────────────────────────────────────
+# INTERNAL: Telegram Helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _send_tg_msg(text: str):
+    """Helper to send status updates to the admin chat."""
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not bot_token or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    try:
+        requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=5)
+    except Exception as e:
+        logger.error(f"[Telegram] Failed to send message: {e}")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TASK 1: OPENSKY LIVE INGESTION
@@ -84,7 +97,6 @@ def _wait_for_db(max_attempts: int = 30, sleep_s: float = 2.0) -> bool:
     queue="ingestion",
 )
 def ingest_live_opensky_task(self, region_keys: Optional[List[str]] = None):
-    # 🚨 DISTRIBUTED LOCK: Prevent overlapping executions
     with acquire_lock("lock:ingestion:opensky", timeout=600) as acquired:
         if not acquired:
             logger.info("[OpenSky Task] Already running. Skipping to prevent overlap.")
@@ -127,7 +139,6 @@ def ingest_live_opensky_task(self, region_keys: Optional[List[str]] = None):
     queue="ingestion",
 )
 def ingest_live_airlabs_task(self, region_keys: Optional[List[str]] = None):
-    # 🚨 DISTRIBUTED LOCK: Prevent overlapping executions
     with acquire_lock("lock:ingestion:airlabs", timeout=600) as acquired:
         if not acquired:
             logger.info("[AirLabs Task] Already running. Skipping to prevent overlap.")
@@ -170,7 +181,6 @@ def ingest_live_airlabs_task(self, region_keys: Optional[List[str]] = None):
     queue="ingestion",
 )
 def ingest_live_fr24_task(self, region_keys: Optional[List[str]] = None):
-    # 🚨 DISTRIBUTED LOCK: Prevent overlapping executions
     with acquire_lock("lock:ingestion:fr24", timeout=600) as acquired:
         if not acquired:
             logger.info("[FR24 Task] Already running. Skipping to prevent overlap.")
@@ -325,7 +335,7 @@ def enrich_flight_details_task(self, fr24_ids: List[str]):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TASK 7: Orphaned Session Sweeper (NEW)
+# TASK 7: Orphaned Session Sweeper
 # ─────────────────────────────────────────────────────────────────────────────
 
 @shared_task(
@@ -334,10 +344,6 @@ def enrich_flight_details_task(self, fr24_ids: List[str]):
     queue="maintenance",
 )
 def close_orphaned_sessions_task(self, timeout_minutes: int = 45):
-    """
-    Periodically sweeps the database to close 'active' sessions that haven't 
-    received any telemetry updates in the specified timeout period.
-    """
     if not _wait_for_db():
         return {"status": "error", "message": "DB tables not ready"}
 
@@ -354,6 +360,186 @@ def close_orphaned_sessions_task(self, timeout_minutes: int = 45):
             return {"status": "failed", "error": str(exc)}
     finally:
         db.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TASK 8: Telegram Backup Engine
+# ─────────────────────────────────────────────────────────────────────────────
+
+@shared_task(
+    bind=True, max_retries=2, default_retry_delay=300,
+    soft_time_limit=1200, time_limit=1800,
+    name="worker.tasks.backup_database_task",
+    queue="maintenance",
+)
+def backup_database_task(self):
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    
+    if not bot_token or not chat_id:
+        return {"status": "skipped", "reason": "credentials_missing"}
+
+    db_url = settings.DATABASE_URL
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"flight_db_backup_{timestamp}.sql.gz"
+    filepath = os.path.join(tempfile.gettempdir(), filename)
+
+    try:
+        logger.info(f"[Backup] Starting database dump to {filepath}...")
+        cmd_full = ["pg_dump", db_url, "-Z", "9", "-f", filepath]
+        result = subprocess.run(cmd_full, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            return {"status": "failed", "error": "pg_dump execution failed"}
+
+        file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
+        is_partial = False
+
+        if file_size_mb > 49.0:
+            os.remove(filepath)
+            filename = f"flight_db_backup_partial_{timestamp}.sql.gz"
+            filepath = os.path.join(tempfile.gettempdir(), filename)
+            cmd_partial = ["pg_dump", db_url, "-Z", "9", "-T", "track_telemetry", "-f", filepath]
+            
+            result_partial = subprocess.run(cmd_partial, capture_output=True, text=True)
+            if result_partial.returncode != 0:
+                return {"status": "failed", "error": "partial pg_dump failed"}
+                
+            file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
+            is_partial = True
+            
+            if file_size_mb > 49.0:
+                return {"status": "failed", "error": "file_exceeds_telegram_limit"}
+
+        url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+        caption = (
+            f"📦 <b>Flight Intelligence Backup</b>\n"
+            f"📅 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
+            f"📊 Size: {file_size_mb:.2f} MB\n"
+            f"⚠️ <i>Partial Backup (Telemetry excluded)</i>" if is_partial else "✅ <i>Full Backup</i>"
+        )
+
+        with open(filepath, "rb") as f:
+            resp = requests.post(
+                url,
+                data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+                files={"document": f},
+                timeout=300
+            )
+
+        if resp.status_code != 200:
+            return {"status": "failed", "error": "Telegram upload failed"}
+
+        return {"status": "success", "file": filename, "size_mb": round(file_size_mb, 2), "is_partial": is_partial}
+
+    except Exception as exc:
+        try:
+            self.retry(exc=exc)
+        except MaxRetriesExceededError:
+            return {"status": "failed", "error": str(exc)}
+    finally:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TASK 9: Telegram Restore Engine (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@shared_task(
+    bind=True, max_retries=0, 
+    soft_time_limit=1800, time_limit=2000,
+    name="worker.tasks.restore_database_task",
+    queue="maintenance",
+)
+def restore_database_task(self, file_id: str, file_name: str):
+    """
+    Downloads a backup file from Telegram, drops all connections to the DB,
+    and restores the database using psql.
+    """
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not bot_token:
+        return {"status": "failed", "reason": "credentials_missing"}
+
+    db_url = settings.DATABASE_URL
+    filepath = os.path.join(tempfile.gettempdir(), file_name)
+
+    try:
+        # 1. Get file path from Telegram
+        logger.info(f"[Restore] Fetching file path for {file_id}...")
+        file_info_url = f"https://api.telegram.org/bot{bot_token}/getFile?file_id={file_id}"
+        file_info_resp = requests.get(file_info_url, timeout=15).json()
+        
+        if not file_info_resp.get("ok"):
+            _send_tg_msg("❌ <b>فشل الاستعادة:</b> لم أتمكن من العثور على الملف في خوادم تليجرام.")
+            return {"status": "failed", "error": "file_not_found_on_telegram"}
+            
+        tg_file_path = file_info_resp["result"]["file_path"]
+        download_url = f"https://api.telegram.org/file/bot{bot_token}/{tg_file_path}"
+
+        # 2. Download the file
+        logger.info(f"[Restore] Downloading {file_name}...")
+        with requests.get(download_url, stream=True, timeout=300) as r:
+            r.raise_for_status()
+            with open(filepath, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192): 
+                    f.write(chunk)
+                    
+        file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
+        logger.info(f"[Restore] Download complete. Size: {file_size_mb:.2f} MB")
+        _send_tg_msg(f"🔄 <b>جاري الاستعادة:</b> تم تحميل الملف ({file_size_mb:.1f} MB).\nجاري إيقاف الاتصالات بقاعدة البيانات...")
+
+        # 3. Isolate the database (Terminate other connections)
+        engine = create_engine(db_url)
+        db_name = engine.url.database
+        terminate_sql = text(f"""
+            SELECT pg_terminate_backend(pg_stat_activity.pid)
+            FROM pg_stat_activity
+            WHERE pg_stat_activity.datname = '{db_name}'
+              AND pid <> pg_backend_pid();
+        """)
+        with engine.connect() as conn:
+            conn.execute(terminate_sql)
+            conn.commit()
+        engine.dispose()
+        
+        logger.info("[Restore] Terminated other DB connections.")
+
+        # 4. Execute the restore (zcat | psql)
+        # Using zcat to decompress on the fly and pipe directly to psql
+        logger.info("[Restore] Executing psql restore...")
+        
+        # Note: psql requires PGPASSWORD environment variable if password is used
+        env = os.environ.copy()
+        if engine.url.password:
+            env["PGPASSWORD"] = engine.url.password
+
+        # Build psql command (without password in URL for security)
+        psql_url = f"postgresql://{engine.url.username}@{engine.url.host}:{engine.url.port}/{db_name}"
+        
+        # The command: zcat file.sql.gz | psql -d url
+        cmd = f"zcat {filepath} | psql -d {psql_url}"
+        
+        result = subprocess.run(cmd, shell=True, env=env, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            logger.error(f"[Restore] psql failed: {result.stderr}")
+            _send_tg_msg(f"❌ <b>فشل الاستعادة:</b> حدث خطأ أثناء تنفيذ السكربت.\n<pre>{result.stderr[:500]}</pre>")
+            return {"status": "failed", "error": "psql_execution_failed"}
+
+        # 5. Success!
+        logger.info("[Restore] Database restored successfully.")
+        _send_tg_msg(f"✅ <b>تمت الاستعادة بنجاح!</b>\nقاعدة البيانات الآن مطابقة لملف <code>{file_name}</code>.")
+        return {"status": "success"}
+
+    except Exception as exc:
+        logger.error(f"[Restore] Exception during restore: {exc}", exc_info=True)
+        _send_tg_msg(f"❌ <b>انهيار أثناء الاستعادة:</b>\n<pre>{str(exc)}</pre>")
+        return {"status": "failed", "error": str(exc)}
+    finally:
+        # 6. Clean up
+        if os.path.exists(filepath):
+            os.remove(filepath)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
