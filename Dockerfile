@@ -16,10 +16,10 @@ ENV VITE_API_URL=""
 RUN npm run build
 
 # Stage 2: Build Backend & Worker
-FROM python:3.11-slim
+# 🔁 استخدم python:3.11-slim-bookworm لتجنب تعارض حزم PostgreSQL 18
+FROM python:3.11-slim-bookworm
 WORKDIR /app
 
-# تثبيت PostgreSQL Client 18 (متوافق مع الخادم 18.3)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libpq-dev \
