@@ -1,6 +1,6 @@
 """
 Celery application – supports redis:// and rediss:// (Upstash/TLS).
-v3.4 — Multi-Source Hybrid Engine Configuration (with Orphaned Session Sweeper)
+v3.5 — Multi-Source Hybrid Engine Configuration (with Telegram Backup Engine)
 """
 import os
 import ssl
@@ -69,11 +69,16 @@ celery_app.conf.update(
             "schedule": 86400.0,
             "args": (0,),
         },
-        # ── NEW: Orphaned Session Sweeper ──
         "close-orphaned-sessions": {
             "task": "worker.tasks.close_orphaned_sessions_task",
             "schedule": 900.0,  # Every 15 minutes
             "args": (45,),      # Close sessions inactive for > 45 minutes
+            "options": {"queue": "maintenance"},
+        },
+        # ── NEW: Telegram Backup Engine ──
+        "backup-database-twice-daily": {
+            "task": "worker.tasks.backup_database_task",
+            "schedule": 43200.0,  # Every 12 hours (12 * 60 * 60)
             "options": {"queue": "maintenance"},
         },
     },
@@ -85,6 +90,7 @@ celery_app.conf.update(
         "worker.tasks.ingest_historical_flights": {"queue": "ingestion"},
         "worker.tasks.cleanup_old_data_task":     {"queue": "maintenance"},
         "worker.tasks.close_orphaned_sessions_task": {"queue": "maintenance"},
+        "worker.tasks.backup_database_task":      {"queue": "maintenance"},
         "worker.tasks.operations_task.execute_operation_task": {"queue": "ingestion"},
         "worker.tasks.operations_task.retry_chunks_task":      {"queue": "maintenance"},
         
@@ -131,6 +137,14 @@ def trigger_initial_ingestion(sender, **kwargs):
     """
     logger.info("[SRE] Worker ready! Triggering initial multi-source ingestion with Jitter...")
     
+    # 0. NEW: Trigger a database backup immediately on startup
+    # This ensures we have a safe snapshot before any new data is ingested
+    sender.app.send_task(
+        "worker.tasks.backup_database_task",
+        queue="maintenance"
+    )
+    logger.info("[SRE] Scheduled Database Backup task.")
+
     # 1. OpenSky starts immediately (Fastest, most likely to be blocked)
     sender.app.send_task(
         "worker.tasks.ingest_live_opensky_task",
