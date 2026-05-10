@@ -1,11 +1,10 @@
 """
-Celery Tasks — Flight Intelligence Worker (v4.0 — Distributed Locking)
+Celery Tasks — Flight Intelligence Worker (v4.1 — Orphaned Session Sweeper Added)
 All task definitions match beat_schedule entries exactly.
 
-UPGRADES FROM v3.1:
-  [FIX] Introduced Redis Distributed Locks (`acquire_lock`) to prevent Task Pile-up.
-        If a task (e.g., OpenSky) is already running and takes longer than its schedule,
-        the next triggered instance will instantly skip execution, preventing DB Deadlocks.
+UPGRADES FROM v4.0:
+  [NEW] Added `close_orphaned_sessions_task` to periodically close 'active' 
+        flight sessions that haven't received updates in 45 minutes.
 """
 from . import operations_task
 from celery import shared_task
@@ -24,6 +23,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
 
 from worker.ingestion_service import FlightIngestionService
 from app.config import settings
+from app.database import SessionLocal
+from app.crud import EnterpriseDataRouter
 
 logger = logging.getLogger(__name__)
 
@@ -321,6 +322,38 @@ def enrich_flight_details_task(self, fr24_ids: List[str]):
             self.retry(exc=exc)
         except MaxRetriesExceededError:
             return {"status": "failed", "error": str(exc)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TASK 7: Orphaned Session Sweeper (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@shared_task(
+    bind=True, max_retries=2, default_retry_delay=60,
+    name="worker.tasks.close_orphaned_sessions_task",
+    queue="maintenance",
+)
+def close_orphaned_sessions_task(self, timeout_minutes: int = 45):
+    """
+    Periodically sweeps the database to close 'active' sessions that haven't 
+    received any telemetry updates in the specified timeout period.
+    """
+    if not _wait_for_db():
+        return {"status": "error", "message": "DB tables not ready"}
+
+    db = SessionLocal()
+    try:
+        logger.info(f"[Sweeper Task] Sweeping for sessions inactive for >{timeout_minutes} mins...")
+        closed_count = EnterpriseDataRouter.close_orphaned_sessions(db, timeout_minutes)
+        return {"status": "success", "closed_sessions": closed_count}
+    except Exception as exc:
+        logger.error(f"[Sweeper Task] Failed: {exc}", exc_info=True)
+        try:
+            self.retry(exc=exc)
+        except MaxRetriesExceededError:
+            return {"status": "failed", "error": str(exc)}
+    finally:
+        db.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
