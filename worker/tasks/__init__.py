@@ -363,7 +363,7 @@ def close_orphaned_sessions_task(self, timeout_minutes: int = 45):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TASK 8: Telegram Backup Engine
+# TASK 8: Telegram Backup Engine (FIXED)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @shared_task(
@@ -375,7 +375,7 @@ def close_orphaned_sessions_task(self, timeout_minutes: int = 45):
 def backup_database_task(self):
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    
+
     if not bot_token or not chat_id:
         return {"status": "skipped", "reason": "credentials_missing"}
 
@@ -385,11 +385,35 @@ def backup_database_task(self):
     filepath = os.path.join(tempfile.gettempdir(), filename)
 
     try:
+        # Parse database URL securely (same approach as restore task)
+        engine = create_engine(db_url)
+        url_obj = engine.url
+        host = url_obj.host
+        port = str(url_obj.port) if url_obj.port else "5432"
+        dbname = url_obj.database
+        user = url_obj.username
+        password = url_obj.password
+
+        env = os.environ.copy()
+        if password:
+            env["PGPASSWORD"] = password
+
+        # Build pg_dump command without password in URL to avoid special-char issues
+        cmd_full = [
+            "pg_dump",
+            "-h", host,
+            "-p", port,
+            "-U", user,
+            "-d", dbname,
+            "-Z", "9",
+            "-f", filepath
+        ]
+
         logger.info(f"[Backup] Starting database dump to {filepath}...")
-        cmd_full = ["pg_dump", db_url, "-Z", "9", "-f", filepath]
-        result = subprocess.run(cmd_full, capture_output=True, text=True)
+        result = subprocess.run(cmd_full, capture_output=True, text=True, env=env)
 
         if result.returncode != 0:
+            logger.error(f"[Backup] pg_dump failed: {result.stderr}")
             return {"status": "failed", "error": "pg_dump execution failed"}
 
         file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
@@ -399,15 +423,25 @@ def backup_database_task(self):
             os.remove(filepath)
             filename = f"flight_db_backup_partial_{timestamp}.sql.gz"
             filepath = os.path.join(tempfile.gettempdir(), filename)
-            cmd_partial = ["pg_dump", db_url, "-Z", "9", "-T", "track_telemetry", "-f", filepath]
-            
-            result_partial = subprocess.run(cmd_partial, capture_output=True, text=True)
+            cmd_partial = [
+                "pg_dump",
+                "-h", host,
+                "-p", port,
+                "-U", user,
+                "-d", dbname,
+                "-Z", "9",
+                "-T", "track_telemetry",
+                "-f", filepath
+            ]
+
+            result_partial = subprocess.run(cmd_partial, capture_output=True, text=True, env=env)
             if result_partial.returncode != 0:
+                logger.error(f"[Backup] Partial pg_dump failed: {result_partial.stderr}")
                 return {"status": "failed", "error": "partial pg_dump failed"}
-                
+
             file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
             is_partial = True
-            
+
             if file_size_mb > 49.0:
                 return {"status": "failed", "error": "file_exceeds_telegram_limit"}
 
@@ -469,11 +503,11 @@ def restore_database_task(self, file_id: str, file_name: str):
         logger.info(f"[Restore] Fetching file path for {file_id}...")
         file_info_url = f"https://api.telegram.org/bot{bot_token}/getFile?file_id={file_id}"
         file_info_resp = requests.get(file_info_url, timeout=15).json()
-        
+
         if not file_info_resp.get("ok"):
             _send_tg_msg("❌ <b>فشل الاستعادة:</b> لم أتمكن من العثور على الملف في خوادم تليجرام.")
             return {"status": "failed", "error": "file_not_found_on_telegram"}
-            
+
         tg_file_path = file_info_resp["result"]["file_path"]
         download_url = f"https://api.telegram.org/file/bot{bot_token}/{tg_file_path}"
 
@@ -484,7 +518,7 @@ def restore_database_task(self, file_id: str, file_name: str):
             with open(filepath, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=8192): 
                     f.write(chunk)
-                    
+
         file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
         logger.info(f"[Restore] Download complete. Size: {file_size_mb:.2f} MB")
         _send_tg_msg(f"🔄 <b>جاري الاستعادة:</b> تم تحميل الملف ({file_size_mb:.1f} MB).\nجاري إيقاف الاتصالات بقاعدة البيانات...")
@@ -502,13 +536,13 @@ def restore_database_task(self, file_id: str, file_name: str):
             conn.execute(terminate_sql)
             conn.commit()
         engine.dispose()
-        
+
         logger.info("[Restore] Terminated other DB connections.")
 
         # 4. Execute the restore (zcat | psql)
         # Using zcat to decompress on the fly and pipe directly to psql
         logger.info("[Restore] Executing psql restore...")
-        
+
         # Note: psql requires PGPASSWORD environment variable if password is used
         env = os.environ.copy()
         if engine.url.password:
@@ -516,10 +550,10 @@ def restore_database_task(self, file_id: str, file_name: str):
 
         # Build psql command (without password in URL for security)
         psql_url = f"postgresql://{engine.url.username}@{engine.url.host}:{engine.url.port}/{db_name}"
-        
+
         # The command: zcat file.sql.gz | psql -d url
         cmd = f"zcat {filepath} | psql -d {psql_url}"
-        
+
         result = subprocess.run(cmd, shell=True, env=env, capture_output=True, text=True)
 
         if result.returncode != 0:
