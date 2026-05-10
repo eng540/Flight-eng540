@@ -1,6 +1,6 @@
 """
 Celery application – supports redis:// and rediss:// (Upstash/TLS).
-v3.3 — Multi-Source Hybrid Engine Configuration (with Startup Jitter & Tuned Schedules)
+v3.4 — Multi-Source Hybrid Engine Configuration (with Orphaned Session Sweeper)
 """
 import os
 import ssl
@@ -43,8 +43,6 @@ celery_app.conf.update(
 
     beat_schedule={
         # ── 1. OpenSky: Primary Free Source ──
-        # FIX: Increased from 60s to 300s (5 mins) to prevent Task Pile-up
-        # since the task itself can take ~150s to complete.
         "ingest-live-opensky": {
             "task": "worker.tasks.ingest_live_opensky_task",
             "schedule": 300.0,
@@ -61,7 +59,6 @@ celery_app.conf.update(
         },
         
         # ── System Maintenance ──
-        # FIX: Increased from 30s to 3600s (1 hour) to reduce empty task spam.
         "retry-ops-chunks": {
             "task": "worker.tasks.operations_task.retry_chunks_task",
             "schedule": 3600.0,
@@ -72,6 +69,13 @@ celery_app.conf.update(
             "schedule": 86400.0,
             "args": (0,),
         },
+        # ── NEW: Orphaned Session Sweeper ──
+        "close-orphaned-sessions": {
+            "task": "worker.tasks.close_orphaned_sessions_task",
+            "schedule": 900.0,  # Every 15 minutes
+            "args": (45,),      # Close sessions inactive for > 45 minutes
+            "options": {"queue": "maintenance"},
+        },
     },
 
     task_routes={
@@ -80,6 +84,7 @@ celery_app.conf.update(
         "worker.tasks.ingest_live_fr24_task":     {"queue": "ingestion"},
         "worker.tasks.ingest_historical_flights": {"queue": "ingestion"},
         "worker.tasks.cleanup_old_data_task":     {"queue": "maintenance"},
+        "worker.tasks.close_orphaned_sessions_task": {"queue": "maintenance"},
         "worker.tasks.operations_task.execute_operation_task": {"queue": "ingestion"},
         "worker.tasks.operations_task.retry_chunks_task":      {"queue": "maintenance"},
         
