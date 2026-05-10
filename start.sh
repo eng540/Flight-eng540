@@ -40,7 +40,7 @@ if [ -n "$REDIS_URL" ]; then
     celery -A worker.celery_app worker \
         -l info \
         -Q ingestion,maintenance,default \
-        --concurrency=2 \
+        --concurrency=4 \
         --without-gossip \
         --without-mingle &
 

@@ -1,126 +1,151 @@
+
 # ✈️ منصة استخبارات الطيران | Flight Intelligence Platform
 
 <div dir="rtl">
 
-## نظرة عامة
-
-منصة تحليل بيانات الطيران الجوي في الوقت الفعلي، مبنية على Flightradar24 API.
-تدعم التتبع اللحظي للطائرات، والاستعلام التاريخي متعدد الأبعاد، ولوحات تحليلية كاملة باللغة العربية.
-
-## المتطلبات
-
-| المتطلب | الإصدار |
-|---|---|
-| Docker | 24+ |
-| Docker Compose | 2.20+ |
-| مفتاح FR24 API | احصل عليه من fr24api.flightradar24.com |
-
-## التشغيل السريع
-
-```bash
-cp .env.example .env
-# عدّل FR24_API_KEY في ملف .env
-docker compose up -d
-docker compose logs -f backend
-```
-
-الواجهة: http://localhost | API Docs: http://localhost:8000/docs
-
-## API Endpoints
-
-| Endpoint | الوصف |
-|---|---|
-| `GET /api/v1/live/positions` | مواقع الطائرات اللحظية |
-| `GET /api/v1/flights/search` | بحث متعدد الحقول |
-| `GET /api/v1/flights/{id}` | تفاصيل رحلة |
-| `GET /api/v1/flights/{id}/trajectory` | مسار الرحلة |
-| `GET /api/v1/aircraft/{icao24}/history` | سجل طائرة |
-| `POST /api/v1/history/query` | محرك البيانات التاريخية |
-| `GET /api/v1/analytics/top-routes` | أكثر الطرق ازدحاماً |
-| `GET /api/v1/analytics/busiest-airports` | أكثر المطارات حركةً |
-| `GET /api/v1/analytics/daily-summary` | ملخص يومي |
-| `GET /api/v1/analytics/airline-performance` | أداء الناقلين |
-| `GET /api/v1/analytics/export-csv` | تصدير CSV |
-| `GET /api/v1/history/export` | تصدير سجل تاريخي |
-| `GET /api/v1/system/credits-usage` | استهلاك اعتمادات FR24 |
-
-## إدارة الخدمات
-
-```bash
-docker compose down                           # إيقاف
-docker compose down -v                        # إيقاف + حذف البيانات
-docker compose exec backend alembic upgrade head   # تشغيل migrations
-docker compose logs -f worker beat            # مراقبة المهام
-```
-
-</div>
+## 🌟 نظرة عامة (Overview)
+منصة إنتاجية متقدمة (Production-Grade) لتتبع وتحليل بيانات الطيران الجوي في الوقت الفعلي والتاريخي. 
+تعتمد المنصة على **محرك استيعاب هجين (Hybrid Ingestion Engine)** يسحب البيانات من مصادر متعددة (FlightRadar24, AirLabs, OpenSky) مع آليات حماية ذاتية (Self-Healing) وقواطع دوائر (Circuit Breakers) للتعامل مع حظر الشبكات. الواجهة الأمامية معربة بالكامل (RTL) وتقدم لوحات تحليلية، ومحرك بحث تاريخي، ولوحة تحكم بالعمليات.
 
 ---
 
-# ✈️ Flight Intelligence Platform
+## 🏗️ البنية المعمارية (Architecture)
 
-## Overview
+```text
+[External APIs] (FR24, AirLabs, OpenSky)
+       │
+       ▼
+[Celery Workers] ──(Circuit Breakers & Fast-Fail)──> [Redis] (Message Broker)
+       │
+       ▼
+[Data Router] ──(Physics Validation & Deduplication)
+       │
+       ▼
+[PostgreSQL] (Snowflake Schema: Facts, Dimensions, Time-Series, Fast-Cache)
+       │
+       ▼
+[FastAPI Backend] ──(Pydantic Validation & REST Endpoints)
+       │
+       ▼
+[React/Vite Frontend] (Tailwind, Shadcn/UI, Leaflet Maps, Recharts)
+```
 
-Real-time aviation intelligence platform built on Flightradar24 API.
-Features live tracking, multi-dimensional historical queries, and full Arabic dashboards.
+---
 
-## Quick Start
+## ✨ أحدث الميزات الهندسية (Recent Engineering Upgrades)
+- **محرك متعدد المصادر (Multi-Source Engine):** دمج بيانات FR24 (أساسي)، AirLabs (للمسارات)، و OpenSky (مجاني/عالي التردد).
+- **قاطع الدائرة الذكي (Smart Circuit Breaker):** حماية الـ Workers من الاستنزاف عند حظر الـ IP باستخدام آلة حالة (CLOSED, OPEN, HALF_OPEN) وتراجع أسي (Exponential Backoff).
+- **لوحة العمليات (Operations Board):** محرك "ما قبل التنفيذ" (Preflight Engine) لحساب تكلفة الـ API (Credits) وتقسيم المهام التاريخية الكبيرة تلقائياً (Auto-chunking).
+- **واجهة مستخدم عربية (Full RTL):** دعم كامل للغة العربية مع خط `Tajawal` لجميع المكونات والرسوم البيانية.
+
+---
+
+## 🚀 التشغيل المحلي للتطوير (Local Development - VS Code)
+
+لتشغيل النظام محلياً بدون Docker (مفيد جداً لتصحيح الأخطاء Debugging):
+
+### 1. المتطلبات الأساسية (Prerequisites)
+- Python 3.11+
+- Node.js 20+
+- PostgreSQL (يعمل على البورت 5432، مع قاعدة بيانات فارغة باسم `flight_intelligence`)
+- Redis (يعمل على البورت 6379)
+
+### 2. إعداد الباك إند (Backend)
+افتح نافذة Terminal (Terminal 1):
+```bash
+cd backend
+python -m venv venv
+source venv/bin/activate  # في الويندوز: venv\Scripts\activate
+pip install -r requirements.txt
+
+# إنشاء ملف .env
+echo "DATABASE_URL=postgresql://postgres:postgres@localhost:5432/flight_intelligence" > .env
+echo "REDIS_URL=redis://localhost:6379/0" >> .env
+echo "FR24_API_KEY=your_fr24_key_here" >> .env
+echo "AIRLABS_API_KEY=your_airlabs_key_here" >> .env
+
+# بناء قاعدة البيانات
+alembic upgrade head
+
+# تغذية البيانات الثابتة (المطارات والشركات)
+python ../seed_static_data.py
+
+# تشغيل الخادم
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+### 3. إعداد عمال الخلفية (Celery Workers)
+افتح نافذة Terminal جديدة (Terminal 2) وقم بتفعيل الـ `venv`:
+```bash
+cd worker
+# لمستخدمي Mac/Linux:
+celery -A worker.celery_app:celery_app worker --queues=ingestion,maintenance --loglevel=info --concurrency=2
+# لمستخدمي Windows (إلزامي):
+celery -A worker.celery_app:celery_app worker --queues=ingestion,maintenance --loglevel=info --pool=solo
+```
+
+افتح نافذة Terminal جديدة (Terminal 3) وقم بتفعيل الـ `venv`:
+```bash
+cd worker
+celery -A worker.celery_app:celery_app beat --loglevel=info
+```
+
+### 4. إعداد الواجهة الأمامية (Frontend)
+افتح نافذة Terminal جديدة (Terminal 4):
+```bash
+cd frontend
+npm install
+echo "VITE_API_URL=http://127.0.0.1:8000" > .env
+npm run dev
+```
+✅ **الواجهة تعمل الآن على:** `http://localhost:5173`
+✅ **توثيق الـ API يعمل على:** `http://127.0.0.1:8000/docs`
+
+---
+
+## 🐳 التشغيل عبر دوكر (Production / Docker Compose)
+
+للتشغيل السريع على الخوادم باستخدام حاويات دوكر:
 
 ```bash
-cp .env.example .env      # edit FR24_API_KEY
+# 1. انسخ ملف البيئة وضع مفاتيح الـ API الخاصة بك
+cp .env.example .env
+
+# 2. شغل النظام بالكامل في الخلفية
 docker compose up -d
+
+# 3. راقب سجلات الباك إند أو الـ Worker
+docker compose logs -f backend
+docker compose logs -f worker
 ```
+الواجهة: `http://localhost` | الـ API: `http://localhost:8000`
 
-UI: http://localhost | API: http://localhost:8000/docs
+---
 
-## Architecture
+## ⚙️ المتغيرات البيئية (Environment Variables)
 
-```
-FR24 API → Celery Worker → PostgreSQL (Snowflake Schema)
-                                  ↕
-                     FastAPI backend (/api/v1/*)
-                                  ↕
-                  React frontend (Arabic RTL, Leaflet, Recharts)
-```
-
-## Key Fixes Applied
-
-| Issue | Fix |
-|---|---|
-| fr24_id never stored | Extracted from FR24 FlightPositionsFull.fr24_id |
-| on_ground = (alt==0) | Fixed to: alt < 100 AND gspeed < 30 |
-| hashlib.md5 as dedup key | Removed — fr24_id is the stable key |
-| painted_as fallback | Removed — operating_as only |
-| cleanup_old_data() was no-op | Real 30-day retention deletion |
-| ingest_date_range_for_region() missing | Implemented |
-| NameError in tasks.py | except scr → except exc |
-| IngestionJobResponse schema mismatch | 9 columns added to model |
-| N+1 in get_top_routes | aliased dual-join — 1 query |
-| N+1 in get_airline_performance | CASE WHEN aggregate — 1 query |
-| Arabic UI missing | Full RTL + Tajawal font |
-| 11 endpoints missing | All implemented |
-
-## Environment Variables
-
-| Variable | Required | Description |
+| المتغير | إلزامي؟ | الوصف |
 |---|---|---|
-| FR24_API_KEY | YES | Flightradar24 Bearer token |
-| DATABASE_URL | YES | PostgreSQL connection |
-| REDIS_URL | YES | Redis connection |
-| ACTIVE_REGIONS | No | Comma-separated region keys |
-| DATA_RETENTION_DAYS | No | Days to keep data (0=forever) |
+| `DATABASE_URL` | نعم | رابط الاتصال بـ PostgreSQL |
+| `REDIS_URL` | نعم | رابط الاتصال بـ Redis |
+| `FR24_API_KEY` | نعم | مفتاح FlightRadar24 (المصدر الأساسي) |
+| `AIRLABS_API_KEY` | لا | مفتاح AirLabs (لجلب مسارات الرحلات الدقيقة) |
+| `OPENSKY_USERNAME` | لا | حساب OpenSky (لزيادة حد الطلبات المجانية) |
+| `DATA_RETENTION_DAYS` | لا | عدد أيام الاحتفاظ بالبيانات (الافتراضي: 30) |
+| `ACTIVE_REGIONS` | لا | المناطق المفعلة (مثال: `middle_east,north_africa`) |
 
-## Service Management
+---
 
-```bash
-# Manual migration
-docker compose exec backend alembic upgrade head
+## 🛡️ إدارة النظام (System Management)
 
-# Trigger historical ingestion
-docker compose exec worker celery -A worker.celery_app:celery_app call \
-  worker.tasks.ingest_historical_flights \
-  --args='["2026-04-01","2026-04-07",["middle_east"]]'
+**تصدير البيانات (Exporting Data):**
+يدعم النظام تصدير البيانات بصيغة CSV من جميع الواجهات (البحث، التاريخية، التحليلات، والعمليات). يتم حل مشكلة (N+1 Queries) برمجياً لضمان تصدير ملايين السجلات دون انهيار الذاكرة.
 
-# DB shell
-docker compose exec postgres psql -U flightuser -d flightdb
+**تنظيف البيانات (Data Pruning):**
+تعمل مهمة `cleanup_old_data_task` يومياً لحذف السجلات الأقدم من `DATA_RETENTION_DAYS` للحفاظ على أداء قاعدة البيانات.
+
+</div>
 ```
+
+---
+

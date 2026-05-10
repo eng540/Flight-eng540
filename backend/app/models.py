@@ -1,11 +1,12 @@
 """
-Enterprise Aviation Intelligence Models (v3.2 — TIER 0 Fixed)
+Enterprise Aviation Intelligence Models (v3.3 — Multi-Source Ready)
 SQLAlchemy ORM representation of the Snowflake Schema.
 
-CHANGES FROM v3.1:
-  TrackTelemetry      → +operation_id, +chunk_id
-                        Evidence: Added in DB migration 003 but missing in ORM,
-                        causing 500 Internal Server Error during CSV export.
+CHANGES FROM v3.2:
+  TrackTelemetry      → +data_source
+  CurrentAircraftState→ +data_source
+                        Evidence: Business requirement to support and track
+                        multiple live data sources (OpenSky, AirLabs, FR24).
 """
 from sqlalchemy import (
     Column, Integer, String, Float, DateTime, ForeignKey,
@@ -74,7 +75,6 @@ class DimAircraft(Base):
     operator_id   = Column(Integer,    ForeignKey("dim_operator.id"), nullable=True)
     country_code  = Column(String(2),  nullable=True)
 
-    # SCD Type 2 boundaries
     valid_from    = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     valid_to      = Column(DateTime(timezone=True), nullable=True)
 
@@ -100,7 +100,6 @@ class FactFlightSession(Base):
     aircraft_id  = Column(Integer,   ForeignKey("dim_aircraft.id"),  nullable=False, index=True)
     operator_id  = Column(Integer,   ForeignKey("dim_operator.id"),  nullable=True,  index=True)
 
-    # ── FR24 Primary Keys ─────────────────────────────────────────────────
     fr24_id      = Column(String(20), nullable=True, index=True)
     flight_number = Column(String(20), nullable=True, index=True)
     callsign     = Column(String(20), nullable=True, index=True)
@@ -117,7 +116,6 @@ class FactFlightSession(Base):
     total_distance_km  = Column(Float, nullable=True)
     max_altitude_m     = Column(Float, nullable=True)
 
-    # Relationships
     aircraft    = relationship("DimAircraft")
     operator    = relationship("DimOperator")
     dep_airport = relationship("DimGeography", foreign_keys=[dep_airport_id])
@@ -125,18 +123,8 @@ class FactFlightSession(Base):
     tracks      = relationship("TrackTelemetry", back_populates="session",
                                cascade="all, delete-orphan")
 
-    # Operations Board: links this session to the Operation that ingested it.
-    operation_id = Column(
-        BigInteger,
-        ForeignKey("operations.id"),
-        nullable=True,
-        index=True,
-    )
-    chunk_id = Column(
-        BigInteger,
-        ForeignKey("operation_chunks.id"),
-        nullable=True,
-    )
+    operation_id = Column(BigInteger, ForeignKey("operations.id"), nullable=True, index=True)
+    chunk_id = Column(BigInteger, ForeignKey("operation_chunks.id"), nullable=True)
 
     __table_args__ = (
         Index("idx_flight_search",    "callsign",       "first_seen_ts"),
@@ -175,9 +163,11 @@ class TrackTelemetry(Base):
     is_on_ground = Column(Boolean, default=False)
     squawk       = Column(String(4), nullable=True)
 
-    # ── FIX ADDED HERE: Operations Board Tagging ──────────────────────────
     operation_id = Column(BigInteger, nullable=True)
     chunk_id     = Column(BigInteger, nullable=True)
+
+    # ── NEW: Data Source Tracking ──
+    data_source  = Column(String(20), nullable=True)
 
     session = relationship("FactFlightSession", back_populates="tracks")
 
@@ -198,8 +188,8 @@ class FactAviationEvent(Base):
     aircraft_id = Column(Integer,    ForeignKey("dim_aircraft.id"),          nullable=False)
     session_id  = Column(BigInteger, ForeignKey("fact_flight_session.session_id"), nullable=True)
 
-    event_category = Column(String(50), nullable=False)  # EMERGENCY, SYSTEM, FLIGHT
-    event_type     = Column(String(50), nullable=False)  # SQUAWK_7700, TAKEOFF, etc.
+    event_category = Column(String(50), nullable=False)
+    event_type     = Column(String(50), nullable=False)
     event_details  = Column(JSONB, nullable=True)
 
     __table_args__ = (
@@ -235,6 +225,10 @@ class CurrentAircraftState(Base):
     on_ground    = Column(Boolean, nullable=True)
     squawk       = Column(String(4), nullable=True)
     region_key   = Column(String(50), nullable=True)
+    
+    # ── NEW: Data Source Tracking ──
+    data_source  = Column(String(20), nullable=True)
+
     last_updated = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __table_args__ = (
@@ -249,7 +243,6 @@ class CurrentAircraftState(Base):
 # ═════════════════════════════════════════════════════════════════════════════
 
 class IngestionJob(Base):
-    """Tracks worker jobs and API budget usage."""
     __tablename__ = "ingestion_jobs"
 
     id         = Column(Integer, primary_key=True, index=True)

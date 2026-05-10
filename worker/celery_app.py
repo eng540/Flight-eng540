@@ -1,7 +1,11 @@
-"""Celery application – supports redis:// and rediss:// (Upstash/TLS)."""
+"""
+Celery application – supports redis:// and rediss:// (Upstash/TLS).
+v3.5 — Multi-Source Hybrid Engine Configuration (with Telegram Backup Engine)
+"""
 import os
 import ssl
 import logging
+import random
 
 from celery import Celery
 from celery.signals import task_failure, task_success, worker_ready
@@ -38,15 +42,26 @@ celery_app.conf.update(
     beat_schedule_filename="/tmp/celerybeat-schedule",
 
     beat_schedule={
-        # ── Geo-filtered ingestion every 60 min (was 30, reduced to ease load)
-        "ingest-geo-every-60-minutes": {
-            "task": "worker.tasks.ingest_recent_geo_task",
+        # ── 1. OpenSky: Primary Free Source ──
+        "ingest-live-opensky": {
+            "task": "worker.tasks.ingest_live_opensky_task",
+            "schedule": 300.0,
+        },
+        # ── 2. AirLabs: Secondary Free Source ──
+        "ingest-live-airlabs": {
+            "task": "worker.tasks.ingest_live_airlabs_task",
             "schedule": 3600.0,
         },
-        # ── Cleanup daily (keeps all data by default; DATA_RETENTION_DAYS=0)
+        # ── 3. FR24: Fallback/Premium Source ──
+        "ingest-live-fr24": {
+            "task": "worker.tasks.ingest_live_fr24_task",
+            "schedule": 3600.0,
+        },
+        
+        # ── System Maintenance ──
         "retry-ops-chunks": {
             "task": "worker.tasks.operations_task.retry_chunks_task",
-            "schedule": 30.0,
+            "schedule": 3600.0,
             "options": {"queue": "maintenance"},
         },
         "cleanup-old-data-daily": {
@@ -54,19 +69,34 @@ celery_app.conf.update(
             "schedule": 86400.0,
             "args": (0,),
         },
-        # NOTE: ingest_flights_task (global, no geo) REMOVED.
-        # It was calling /flights/all which times out from cloud IPs exactly
-        # like /flights/area.  Removing it stops wasting one worker thread
-        # on 4-minute timeout loops every 5 minutes.
+        "close-orphaned-sessions": {
+            "task": "worker.tasks.close_orphaned_sessions_task",
+            "schedule": 900.0,  # Every 15 minutes
+            "args": (45,),      # Close sessions inactive for > 45 minutes
+            "options": {"queue": "maintenance"},
+        },
+        # ── NEW: Telegram Backup Engine ──
+        "backup-database-twice-daily": {
+            "task": "worker.tasks.backup_database_task",
+            "schedule": 43200.0,  # Every 12 hours (12 * 60 * 60)
+            "options": {"queue": "maintenance"},
+        },
     },
 
     task_routes={
-        "worker.tasks.ingest_recent_geo_task":    {"queue": "ingestion"},
+        "worker.tasks.ingest_live_opensky_task":  {"queue": "ingestion"},
+        "worker.tasks.ingest_live_airlabs_task":  {"queue": "ingestion"},
+        "worker.tasks.ingest_live_fr24_task":     {"queue": "ingestion"},
         "worker.tasks.ingest_historical_flights": {"queue": "ingestion"},
-        "worker.tasks.ingest_flights_task":       {"queue": "ingestion"},
         "worker.tasks.cleanup_old_data_task":     {"queue": "maintenance"},
+        "worker.tasks.close_orphaned_sessions_task": {"queue": "maintenance"},
+        "worker.tasks.backup_database_task":      {"queue": "maintenance"},
         "worker.tasks.operations_task.execute_operation_task": {"queue": "ingestion"},
         "worker.tasks.operations_task.retry_chunks_task":      {"queue": "maintenance"},
+        
+        # Legacy routes (kept to prevent unregistered task warnings)
+        "worker.tasks.ingest_recent_geo_task":    {"queue": "ingestion"},
+        "worker.tasks.ingest_flights_task":       {"queue": "ingestion"},
         "worker.tasks.run_realtime_radar_task":   {"queue": "ingestion"},
     },
 )
@@ -101,16 +131,43 @@ def health_check_task(self):
 @worker_ready.connect
 def trigger_initial_ingestion(sender, **kwargs):
     """
-    SRE Fix: Trigger ingestion immediately on startup to prevent 
-    the 'Silent Empty UI' issue while waiting for the 60-min schedule.
+    SRE Fix: Trigger all live ingestion tasks on startup with Jitter.
+    This prevents the 'Silent Empty UI' issue while avoiding a 'Trigger Storm'
+    that causes DB Deadlocks and Connection Pool Exhaustion.
     """
-    logger.info("[SRE] Worker ready! Triggering initial geo-ingestion...")
-    # نرسل المهمة إلى الطابور فوراً
+    logger.info("[SRE] Worker ready! Triggering initial multi-source ingestion with Jitter...")
+    
+    # 0. NEW: Trigger a database backup immediately on startup
+    # This ensures we have a safe snapshot before any new data is ingested
     sender.app.send_task(
-        "worker.tasks.ingest_recent_geo_task",
-        queue="ingestion",
-        kwargs={"lookback_hours": 2}
+        "worker.tasks.backup_database_task",
+        queue="maintenance"
     )
+    logger.info("[SRE] Scheduled Database Backup task.")
+
+    # 1. OpenSky starts immediately (Fastest, most likely to be blocked)
+    sender.app.send_task(
+        "worker.tasks.ingest_live_opensky_task",
+        queue="ingestion"
+    )
+    
+    # 2. AirLabs starts after a random delay of 15 to 30 seconds
+    airlabs_delay = random.uniform(15.0, 30.0)
+    sender.app.send_task(
+        "worker.tasks.ingest_live_airlabs_task",
+        queue="ingestion",
+        countdown=airlabs_delay
+    )
+    logger.info(f"[SRE] Scheduled AirLabs initial ingestion in {airlabs_delay:.1f}s")
+    
+    # 3. FR24 starts after a random delay of 45 to 60 seconds
+    fr24_delay = random.uniform(45.0, 60.0)
+    sender.app.send_task(
+        "worker.tasks.ingest_live_fr24_task",
+        queue="ingestion",
+        countdown=fr24_delay
+    )
+    logger.info(f"[SRE] Scheduled FR24 initial ingestion in {fr24_delay:.1f}s")
 
 
 if __name__ == "__main__":
