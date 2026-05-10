@@ -1,12 +1,13 @@
 """
-Enterprise CRUD Operations (v6.3 — Sweeper Concurrency & Deadlock Immunity)
+Enterprise CRUD Operations (v6.4 — Deadlock Eradication & Code Cleanup)
 Compliant with Aviation Physics, State Machines, and FR24 OpenAPI spec.
 
-CHANGES FROM v6.2:
-  [FIX] EnterpriseDataRouter.close_orphaned_sessions:
-        - Implemented Lexicographical Sorting (by session_id) to prevent Deadlocks.
-        - Implemented Micro-batching (batch_size=50) with frequent commits for short transactions.
-        - Added `try...except OperationalError` to isolate batch failures and prevent task crashes.
+CHANGES FROM v6.3:
+  [FIX] EnterpriseDataRouter.process_telemetry_batch:
+        - Removed legacy inline session closing logic. 
+        - Session closing is now exclusively handled by the background 
+          `close_orphaned_sessions` sweeper task.
+        - This eliminates the remaining `FactFlightSession` Deadlocks during high concurrency.
 """
 from sqlalchemy.orm import Session, joinedload, aliased
 from sqlalchemy import func, and_, or_, desc, case
@@ -111,19 +112,16 @@ class EnterpriseDataRouter:
         # ── Step 1: Bulk Pre-fetch & Cache (Eliminate N+1) ───────────────────
         icao24s = list({p.icao24 for p in payloads})
         
-        # Pre-fetch Current States for Validation
         current_states = {
             s.icao24: s for s in db.query(models.CurrentAircraftState)
             .filter(models.CurrentAircraftState.icao24.in_(icao24s)).all()
         }
 
-        # Pre-fetch Aircraft
         aircraft_cache = {
             a.icao24: a for a in db.query(models.DimAircraft)
             .filter(models.DimAircraft.icao24.in_(icao24s), models.DimAircraft.valid_to.is_(None)).all()
         }
 
-        # Pre-fetch Active Sessions
         active_sessions = {
             s.aircraft.icao24: s for s in db.query(models.FactFlightSession)
             .join(models.DimAircraft)
@@ -141,8 +139,6 @@ class EnterpriseDataRouter:
 
         for payload in payloads:
             try:
-                # 🚨 ISOLATION: Use nested transactions for each payload to prevent
-                # a single Deadlock from poisoning the entire batch session.
                 with db.begin_nested():
                     current_state = current_states.get(payload.icao24)
 
@@ -174,7 +170,7 @@ class EnterpriseDataRouter:
                             stats["new_aircrafts"] += 1
                             aircraft_cache[payload.icao24] = aircraft
                         except IntegrityError:
-                            db.rollback() # Recover from concurrent insert
+                            db.rollback() 
                             aircraft = db.query(models.DimAircraft).filter_by(icao24=payload.icao24, valid_to=None).first()
                             aircraft_cache[payload.icao24] = aircraft
 
@@ -185,43 +181,14 @@ class EnterpriseDataRouter:
 
                     # Session State Machine
                     session = active_sessions.get(payload.icao24)
-                    last_on_ground  = current_state.on_ground if current_state else payload.on_ground
-                    is_moving       = payload.velocity and payload.velocity > 50
-                    should_open     = False
+                    is_moving = payload.velocity and payload.velocity > 50
+                    should_open = False
 
+                    # CLEANUP: Removed inline closing logic. 
+                    # Sessions are now exclusively closed by the background Sweeper task.
                     if not session:
                         if not payload.on_ground or is_moving:
                             should_open = True
-                    else:
-                        # Legacy inline closing logic (kept for fast updates during active ingestion)
-                        secs_since = (dt_timestamp - session.last_seen_ts).total_seconds()
-                        should_close   = False
-                        close_reason   = ""
-
-                        if secs_since > 1200:
-                            should_close = True
-                            close_reason = "lost_signal"
-                        elif payload.on_ground and not is_moving and last_on_ground:
-                            if secs_since > 300:
-                                should_close = True
-                                close_reason = "landed"
-
-                        if should_close:
-                            session.flight_status    = close_reason
-                            session.actual_landing_ts = session.last_seen_ts if close_reason == "landed" else None
-                            db.flush()
-                            if close_reason == "lost_signal":
-                                db.add(models.FactAviationEvent(
-                                    timestamp=dt_timestamp, aircraft_id=aircraft.id,
-                                    session_id=session.session_id,
-                                    event_category="SYSTEM", event_type="SIGNAL_LOST",
-                                ))
-                                stats["events"] += 1
-                            
-                            del active_sessions[payload.icao24]
-                            
-                            if not payload.on_ground or is_moving:
-                                should_open = True
 
                     if should_open:
                         session = models.FactFlightSession(
@@ -305,7 +272,6 @@ class EnterpriseDataRouter:
                     })
 
             except OperationalError as exc:
-                # 🚨 RECOVERY: Catch Deadlocks here so they don't poison the whole batch
                 logger.warning(f"[Router] OperationalError (Deadlock?) on {payload.icao24}. Skipping. Details: {exc}")
                 stats["errors"] += 1
             except Exception as exc:
@@ -322,17 +288,14 @@ class EnterpriseDataRouter:
 
         # ── Step 3: Atomic Upsert for CurrentAircraftState ───────────────────
         if state_upsert_dicts:
-            # 1. Lexicographical Sorting (Prevents Deadlocks)
             state_upsert_dicts.sort(key=lambda x: x["icao24"])
 
-            # 2. Micro-batching
             batch_size = 50
             for i in range(0, len(state_upsert_dicts), batch_size):
                 batch = state_upsert_dicts[i:i+batch_size]
                 
                 stmt = pg_insert(models.CurrentAircraftState).values(batch)
                 
-                # 3. Source Priority Logic (FR24 > AIRLABS > OPENSKY)
                 priority_sql = case(
                     (stmt.excluded.data_source == 'FR24', 3),
                     (stmt.excluded.data_source == 'AIRLABS', 2),
@@ -348,7 +311,6 @@ class EnterpriseDataRouter:
 
                 update_dict = {c.name: c for c in stmt.excluded if c.name != 'icao24'}
 
-                # 4. Timestamp-based conflict resolution & Stale write protection
                 update_stmt = stmt.on_conflict_do_update(
                     index_elements=['icao24'],
                     set_=update_dict,
@@ -361,7 +323,6 @@ class EnterpriseDataRouter:
                     )
                 )
 
-                # 5. Failure-safe execution
                 try:
                     with db.begin_nested():
                         db.execute(update_stmt)
@@ -389,16 +350,10 @@ class EnterpriseDataRouter:
     
     @staticmethod
     def close_orphaned_sessions(db: Session, timeout_minutes: int = 45) -> int:
-        """
-        Sweeps the database for 'active' sessions that haven't received any 
-        telemetry updates in the specified timeout period.
-        Implements Micro-batching and Sorting to prevent Deadlocks.
-        """
         cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=timeout_minutes)
         closed_count = 0
 
         try:
-            # 1. Fetch all orphans
             orphans = db.query(models.FactFlightSession).filter(
                 models.FactFlightSession.flight_status == "active",
                 models.FactFlightSession.last_seen_ts < cutoff_time
@@ -407,11 +362,8 @@ class EnterpriseDataRouter:
             if not orphans:
                 return 0
 
-            # 2. Lexicographical Sorting (Crucial for Deadlock prevention)
-            # Sorting by session_id ensures consistent lock acquisition order
             orphans.sort(key=lambda s: s.session_id)
 
-            # 3. Micro-batching (Short Transactions)
             batch_size = 50
             for i in range(0, len(orphans), batch_size):
                 batch = orphans[i:i+batch_size]
@@ -437,12 +389,10 @@ class EnterpriseDataRouter:
                             event_type="AUTO_CLOSED"
                         ))
                     
-                    # 4. Commit per batch to release locks quickly
                     db.commit()
                     closed_count += len(batch)
                     
                 except OperationalError as exc:
-                    # 5. Error Isolation: Rollback only the failed batch
                     logger.warning(f"[Sweeper] Deadlock detected in batch. Skipping this batch. Details: {exc}")
                     db.rollback()
                 except Exception as exc:
@@ -476,7 +426,7 @@ class EnterpriseDataRouter:
             except IntegrityError:
                 geo = db.query(models.DimGeography).filter_by(icao_code=key).first()
             except OperationalError:
-                return None # Recover from deadlock
+                return None 
         
         if geo:
             cache[key] = geo.id
@@ -499,7 +449,7 @@ class EnterpriseDataRouter:
             except IntegrityError:
                 op = db.query(models.DimOperator).filter_by(icao_code=key).first()
             except OperationalError:
-                return None # Recover from deadlock
+                return None 
                 
         if op:
             cache[key] = {"id": op.id, "name": op.name}
