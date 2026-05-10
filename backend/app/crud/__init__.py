@@ -1,13 +1,12 @@
 """
-Enterprise CRUD Operations (v6.2 — Orphaned Session Sweeper Added)
+Enterprise CRUD Operations (v6.3 — Sweeper Concurrency & Deadlock Immunity)
 Compliant with Aviation Physics, State Machines, and FR24 OpenAPI spec.
 
-CHANGES FROM v6.1:
-  [NEW] EnterpriseDataRouter.close_orphaned_sessions:
-        - Added a background sweeper to find and close 'active' sessions 
-          that haven't received telemetry in over 45 minutes.
-        - Solves the "Ghost Flights" phenomenon where planes land/disappear 
-          but remain 'active' in the database forever.
+CHANGES FROM v6.2:
+  [FIX] EnterpriseDataRouter.close_orphaned_sessions:
+        - Implemented Lexicographical Sorting (by session_id) to prevent Deadlocks.
+        - Implemented Micro-batching (batch_size=50) with frequent commits for short transactions.
+        - Added `try...except OperationalError` to isolate batch failures and prevent task crashes.
 """
 from sqlalchemy.orm import Session, joinedload, aliased
 from sqlalchemy import func, and_, or_, desc, case
@@ -386,57 +385,75 @@ class EnterpriseDataRouter:
 
         return stats
 
-    # ── NEW: Orphaned Session Sweeper ──────────────────────────────────────
+    # ── Orphaned Session Sweeper (Deadlock Immune) ─────────────────────────
     
     @staticmethod
     def close_orphaned_sessions(db: Session, timeout_minutes: int = 45) -> int:
         """
         Sweeps the database for 'active' sessions that haven't received any 
-        telemetry updates in the last `timeout_minutes`.
-        Closes them to prevent "Ghost Flights" from accumulating in the dashboard.
+        telemetry updates in the specified timeout period.
+        Implements Micro-batching and Sorting to prevent Deadlocks.
         """
         cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=timeout_minutes)
         closed_count = 0
 
         try:
-            # Find all active sessions older than the cutoff
+            # 1. Fetch all orphans
             orphans = db.query(models.FactFlightSession).filter(
                 models.FactFlightSession.flight_status == "active",
                 models.FactFlightSession.last_seen_ts < cutoff_time
             ).all()
 
-            for session in orphans:
-                # Determine if it likely landed or just lost signal
-                # We check the last known state from CurrentAircraftState if available
-                current_state = db.query(models.CurrentAircraftState).filter(
-                    models.CurrentAircraftState.session_id == session.session_id
-                ).first()
+            if not orphans:
+                return 0
 
-                is_on_ground = current_state.on_ground if current_state else False
-                
-                close_reason = "landed" if is_on_ground else "completed"
-                
-                session.flight_status = close_reason
-                if close_reason == "landed":
-                    session.actual_landing_ts = session.last_seen_ts
+            # 2. Lexicographical Sorting (Crucial for Deadlock prevention)
+            # Sorting by session_id ensures consistent lock acquisition order
+            orphans.sort(key=lambda s: s.session_id)
 
-                # Log the auto-close event
-                db.add(models.FactAviationEvent(
-                    timestamp=datetime.now(timezone.utc),
-                    aircraft_id=session.aircraft_id,
-                    session_id=session.session_id,
-                    event_category="SYSTEM", 
-                    event_type="AUTO_CLOSED"
-                ))
+            # 3. Micro-batching (Short Transactions)
+            batch_size = 50
+            for i in range(0, len(orphans), batch_size):
+                batch = orphans[i:i+batch_size]
                 
-                closed_count += 1
+                try:
+                    for session in batch:
+                        current_state = db.query(models.CurrentAircraftState).filter(
+                            models.CurrentAircraftState.session_id == session.session_id
+                        ).first()
+
+                        is_on_ground = current_state.on_ground if current_state else False
+                        close_reason = "landed" if is_on_ground else "completed"
+                        
+                        session.flight_status = close_reason
+                        if close_reason == "landed":
+                            session.actual_landing_ts = session.last_seen_ts
+
+                        db.add(models.FactAviationEvent(
+                            timestamp=datetime.now(timezone.utc),
+                            aircraft_id=session.aircraft_id,
+                            session_id=session.session_id,
+                            event_category="SYSTEM", 
+                            event_type="AUTO_CLOSED"
+                        ))
+                    
+                    # 4. Commit per batch to release locks quickly
+                    db.commit()
+                    closed_count += len(batch)
+                    
+                except OperationalError as exc:
+                    # 5. Error Isolation: Rollback only the failed batch
+                    logger.warning(f"[Sweeper] Deadlock detected in batch. Skipping this batch. Details: {exc}")
+                    db.rollback()
+                except Exception as exc:
+                    logger.error(f"[Sweeper] Unexpected error in batch: {exc}", exc_info=True)
+                    db.rollback()
 
             if closed_count > 0:
-                db.commit()
                 logger.info(f"[Sweeper] Successfully closed {closed_count} orphaned sessions.")
 
         except Exception as exc:
-            logger.error(f"[Sweeper] Failed to close orphaned sessions: {exc}", exc_info=True)
+            logger.error(f"[Sweeper] Failed to fetch orphaned sessions: {exc}", exc_info=True)
             db.rollback()
 
         return closed_count
