@@ -1,12 +1,13 @@
 """
-Enterprise CRUD Operations (v6.1 — Deadlock Recovery & Session Poisoning Fix)
+Enterprise CRUD Operations (v6.2 — Orphaned Session Sweeper Added)
 Compliant with Aviation Physics, State Machines, and FR24 OpenAPI spec.
 
-CHANGES FROM v6.0:
-  [FIX] EnterpriseDataRouter.process_telemetry_batch:
-        - Added explicit `try...except OperationalError` blocks around `db.flush()`.
-        - Implemented `db.rollback()` on Deadlocks to prevent `PendingRollbackError` cascades.
-        - Isolated session flushes to prevent a single Deadlock from destroying the entire batch.
+CHANGES FROM v6.1:
+  [NEW] EnterpriseDataRouter.close_orphaned_sessions:
+        - Added a background sweeper to find and close 'active' sessions 
+          that haven't received telemetry in over 45 minutes.
+        - Solves the "Ghost Flights" phenomenon where planes land/disappear 
+          but remain 'active' in the database forever.
 """
 from sqlalchemy.orm import Session, joinedload, aliased
 from sqlalchemy import func, and_, or_, desc, case
@@ -193,6 +194,7 @@ class EnterpriseDataRouter:
                         if not payload.on_ground or is_moving:
                             should_open = True
                     else:
+                        # Legacy inline closing logic (kept for fast updates during active ingestion)
                         secs_since = (dt_timestamp - session.last_seen_ts).total_seconds()
                         should_close   = False
                         close_reason   = ""
@@ -311,6 +313,14 @@ class EnterpriseDataRouter:
                 logger.error(f"[Router] Error processing {payload.icao24}: {exc}", exc_info=True)
                 stats["errors"] += 1
 
+        # Flush Sessions and Tracks before Upserting State
+        try:
+            db.flush()
+        except Exception as exc:
+            logger.error(f"[Router] Pre-upsert flush failed: {exc}")
+            db.rollback()
+            return stats
+
         # ── Step 3: Atomic Upsert for CurrentAircraftState ───────────────────
         if state_upsert_dicts:
             # 1. Lexicographical Sorting (Prevents Deadlocks)
@@ -375,6 +385,61 @@ class EnterpriseDataRouter:
             stats["errors"] += 1
 
         return stats
+
+    # ── NEW: Orphaned Session Sweeper ──────────────────────────────────────
+    
+    @staticmethod
+    def close_orphaned_sessions(db: Session, timeout_minutes: int = 45) -> int:
+        """
+        Sweeps the database for 'active' sessions that haven't received any 
+        telemetry updates in the last `timeout_minutes`.
+        Closes them to prevent "Ghost Flights" from accumulating in the dashboard.
+        """
+        cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=timeout_minutes)
+        closed_count = 0
+
+        try:
+            # Find all active sessions older than the cutoff
+            orphans = db.query(models.FactFlightSession).filter(
+                models.FactFlightSession.flight_status == "active",
+                models.FactFlightSession.last_seen_ts < cutoff_time
+            ).all()
+
+            for session in orphans:
+                # Determine if it likely landed or just lost signal
+                # We check the last known state from CurrentAircraftState if available
+                current_state = db.query(models.CurrentAircraftState).filter(
+                    models.CurrentAircraftState.session_id == session.session_id
+                ).first()
+
+                is_on_ground = current_state.on_ground if current_state else False
+                
+                close_reason = "landed" if is_on_ground else "completed"
+                
+                session.flight_status = close_reason
+                if close_reason == "landed":
+                    session.actual_landing_ts = session.last_seen_ts
+
+                # Log the auto-close event
+                db.add(models.FactAviationEvent(
+                    timestamp=datetime.now(timezone.utc),
+                    aircraft_id=session.aircraft_id,
+                    session_id=session.session_id,
+                    event_category="SYSTEM", 
+                    event_type="AUTO_CLOSED"
+                ))
+                
+                closed_count += 1
+
+            if closed_count > 0:
+                db.commit()
+                logger.info(f"[Sweeper] Successfully closed {closed_count} orphaned sessions.")
+
+        except Exception as exc:
+            logger.error(f"[Sweeper] Failed to close orphaned sessions: {exc}", exc_info=True)
+            db.rollback()
+
+        return closed_count
 
     # ── Safe FK helpers (Handles Concurrent Inserts) ───────────────────────
 
