@@ -1,16 +1,14 @@
 """
-Analytics API Endpoints — v4.0 (TIER 3 Complete)
+Analytics API Endpoints — v4.1 (Time-Series & Date Range Fix)
 Prefix: /api/v1/analytics
 
-ENDPOINTS (all previously stubs or returning empty data):
-  GET /api/v1/analytics/top-routes            ← was returning []
-  GET /api/v1/analytics/busiest-airports      ← was missing date filter
-  GET /api/v1/analytics/daily-summary         ← was missing entirely
-  GET /api/v1/analytics/airline-performance   ← was missing entirely
-  GET /api/v1/analytics/export-csv            ← was missing entirely
-  GET /api/v1/analytics/summary               ← was stub
-
-Evidence for each fix stated in-line.
+ENDPOINTS:
+  GET /api/v1/analytics/top-routes
+  GET /api/v1/analytics/busiest-airports
+  GET /api/v1/analytics/daily-summary         ← FIX: Now accepts date_from & date_to
+  GET /api/v1/analytics/time-distribution     ← NEW: Hourly heatmap data
+  GET /api/v1/analytics/airline-performance
+  GET /api/v1/analytics/export-csv
 """
 import io
 import csv
@@ -51,12 +49,6 @@ def get_top_routes(
     date_to:   Optional[str] = Query(None, description="YYYY-MM-DD"),
     db: Session = Depends(get_db),
 ):
-    """
-    Top origin→destination pairs by flight count.
-    FIX: was returning [] hardcoded.
-    Evidence: analytics.py line ~42: `return []`
-    Now delegates to AnalyticsCRUD.get_top_routes() with real GROUP BY query.
-    """
     routes = AnalyticsCRUD.get_top_routes(db, limit=limit, date_from=date_from, date_to=date_to)
     return {"total": len(routes), "data": routes}
 
@@ -73,11 +65,6 @@ def get_busiest_airports(
     date_to:   Optional[str] = Query(None, description="YYYY-MM-DD"),
     db: Session = Depends(get_db),
 ):
-    """
-    Airports ranked by total movements (departures + arrivals).
-    FIX: old endpoint counted departures only — arrivals now included.
-    Evidence: analytics.py get_top_airports() joined dep_airport_id only.
-    """
     airports = AnalyticsCRUD.get_busiest_airports(
         db, limit=limit, date_from=date_from, date_to=date_to
     )
@@ -85,24 +72,38 @@ def get_busiest_airports(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Daily Summary
+# Period Summary (formerly Daily Summary)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/daily-summary", summary="ملخص يومي للرحلات")
+@router.get("/daily-summary", summary="ملخص الرحلات للفترة المحددة")
 def get_daily_summary(
-    date: Optional[str] = Query(None, description="YYYY-MM-DD (default: today)"),
+    date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    date_to:   Optional[str] = Query(None, description="YYYY-MM-DD"),
     db: Session = Depends(get_db),
 ):
     """
-    Full single-day summary: totals, statuses, emergencies, top routes.
-    NEW: was missing entirely from the API.
-    Evidence: business requirement GET /api/v1/analytics/daily-summary.
+    FIX: Now accepts a date range instead of a single day.
     """
-    from datetime import datetime, timezone
-
-    date_str = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    summary = AnalyticsCRUD.get_daily_summary(db, date_str)
+    summary = AnalyticsCRUD.get_period_summary(db, date_from=date_from, date_to=date_to)
     return summary
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Time Distribution (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/time-distribution", summary="التوزيع الزمني للرحلات (حسب ساعات اليوم)")
+def get_time_distribution(
+    date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    date_to:   Optional[str] = Query(None, description="YYYY-MM-DD"),
+    db: Session = Depends(get_db),
+):
+    """
+    NEW: Returns flight counts grouped by hour of the day (0-23).
+    Used for Heatmaps and Peak Hour analysis.
+    """
+    distribution = AnalyticsCRUD.get_time_distribution(db, date_from=date_from, date_to=date_to)
+    return {"data": distribution}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,11 +118,6 @@ def get_airline_performance(
     page_size: int           = Query(20, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
-    """
-    Airline-level aggregation: flight counts, duration, distance.
-    NEW: was missing entirely.
-    Evidence: business requirement GET /api/v1/analytics/airline-performance.
-    """
     total, data = AnalyticsCRUD.get_airline_performance(
         db,
         date_from=date_from,
@@ -148,12 +144,6 @@ def export_analytics_csv(
     limit:       int           = Query(1000, ge=1, le=10000),
     db: Session = Depends(get_db),
 ):
-    """
-    Export analytics data as downloadable CSV.
-    NEW: was missing entirely.
-    Evidence: business requirement GET /api/v1/analytics/export-csv.
-    Supports: routes | airports | airlines report types.
-    """
     output = io.StringIO()
 
     if report_type == "routes":
@@ -205,10 +195,6 @@ def export_analytics_csv(
 @router.get("/summary", response_model=AnalyticsSummary, summary="ملخص إجمالي")
 @legacy_router.get("/summary", include_in_schema=False)
 def get_summary(db: Session = Depends(get_db)):
-    """
-    High-level summary counters for dashboard header.
-    FIX: was returning zeros for unique_countries and unique_airports.
-    """
     from app import models
     from sqlalchemy import func
 
@@ -221,7 +207,6 @@ def get_summary(db: Session = Depends(get_db)):
     unique_airports = (
         db.query(func.count(func.distinct(models.DimGeography.id))).scalar() or 0
     )
-    top_countries_raw = AnalyticsCRUD.get_top_routes(db, limit=10)
 
     return AnalyticsSummary(
         total_flights=total,
@@ -233,7 +218,6 @@ def get_summary(db: Session = Depends(get_db)):
 
 @legacy_router.get("/top_countries", include_in_schema=False)
 def legacy_top_countries(limit: int = 15, db: Session = Depends(get_db)):
-    """Legacy endpoint kept for frontend compat."""
     from app import models
     from sqlalchemy import func, desc
 
