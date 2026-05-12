@@ -1,13 +1,12 @@
 """
-Enterprise CRUD Operations (v6.4 — Deadlock Eradication & Code Cleanup)
+Enterprise CRUD Operations (v6.4 — Database-Level Aggregations Added)
 Compliant with Aviation Physics, State Machines, and FR24 OpenAPI spec.
 
 CHANGES FROM v6.3:
-  [FIX] EnterpriseDataRouter.process_telemetry_batch:
-        - Removed legacy inline session closing logic. 
-        - Session closing is now exclusively handled by the background 
-          `close_orphaned_sessions` sweeper task.
-        - This eliminates the remaining `FactFlightSession` Deadlocks during high concurrency.
+  [NEW] FlightQueryCRUD.get_history_aggregations:
+        - Added OLAP-style aggregations to compute accurate stats (total flights, 
+          unique aircraft, total distance, etc.) across the ENTIRE dataset matching 
+          the query, solving the "Paginated Aggregation Bug".
 """
 from sqlalchemy.orm import Session, joinedload, aliased
 from sqlalchemy import func, and_, or_, desc, case
@@ -184,8 +183,6 @@ class EnterpriseDataRouter:
                     is_moving = payload.velocity and payload.velocity > 50
                     should_open = False
 
-                    # CLEANUP: Removed inline closing logic. 
-                    # Sessions are now exclusively closed by the background Sweeper task.
                     if not session:
                         if not payload.on_ground or is_moving:
                             should_open = True
@@ -608,19 +605,9 @@ class FlightQueryCRUD:
         return q.order_by(desc(models.FactFlightSession.first_seen_ts)).offset(offset).limit(page_size).all(), total
 
     @staticmethod
-    def query_history(
-        db: Session,
-        request: schemas.HistoryQueryRequest,
-    ) -> Tuple[List[models.FactFlightSession], int]:
-        q = (
-            db.query(models.FactFlightSession)
-            .options(
-                joinedload(models.FactFlightSession.aircraft),
-                joinedload(models.FactFlightSession.operator),
-                joinedload(models.FactFlightSession.dep_airport),
-                joinedload(models.FactFlightSession.arr_airport),
-            )
-        )
+    def _build_history_base_query(db: Session, request: schemas.HistoryQueryRequest):
+        """Helper to build the base query for both data and aggregations."""
+        q = db.query(models.FactFlightSession)
         eid   = request.entity_id.strip()
         etype = request.entity_type
 
@@ -629,7 +616,7 @@ class FlightQueryCRUD:
                 models.DimAircraft.icao24 == eid.lower()
             ).first()
             if not ac:
-                return [], 0
+                return None
             q = q.filter(models.FactFlightSession.aircraft_id == ac.id)
 
         elif etype == "airport":
@@ -640,7 +627,7 @@ class FlightQueryCRUD:
                 )
             ).first()
             if not geo:
-                return [], 0
+                return None
             q = q.filter(or_(
                 models.FactFlightSession.dep_airport_id == geo.id,
                 models.FactFlightSession.arr_airport_id == geo.id,
@@ -654,7 +641,7 @@ class FlightQueryCRUD:
                 )
             ).first()
             if not op:
-                return [], 0
+                return None
             q = q.filter(models.FactFlightSession.operator_id == op.id)
 
         elif etype == "country":
@@ -674,10 +661,88 @@ class FlightQueryCRUD:
             )
             q = q.filter(models.FactFlightSession.session_id.in_(sub))
 
-        q = _apply_date_filter(q, request.date_from, request.date_to)
+        return _apply_date_filter(q, request.date_from, request.date_to)
+
+    @staticmethod
+    def query_history(
+        db: Session,
+        request: schemas.HistoryQueryRequest,
+    ) -> Tuple[List[models.FactFlightSession], int]:
+        
+        q = FlightQueryCRUD._build_history_base_query(db, request)
+        if q is None:
+            return [], 0
+
+        # Eager load relationships for the paginated data
+        q = q.options(
+            joinedload(models.FactFlightSession.aircraft),
+            joinedload(models.FactFlightSession.operator),
+            joinedload(models.FactFlightSession.dep_airport),
+            joinedload(models.FactFlightSession.arr_airport),
+        )
+
         total  = q.count()
         offset = (request.page - 1) * request.page_size
         return q.order_by(desc(models.FactFlightSession.first_seen_ts)).offset(offset).limit(request.page_size).all(), total
+
+    @staticmethod
+    def get_history_aggregations(
+        db: Session,
+        request: schemas.HistoryQueryRequest,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        NEW: Computes accurate aggregations across the ENTIRE dataset matching the query,
+        not just the paginated subset.
+        """
+        q = FlightQueryCRUD._build_history_base_query(db, request)
+        if q is None:
+            return None
+
+        # 1. Core Aggregations (Total flights, Unique Aircraft, Unique Operators, Total Distance)
+        agg_result = db.query(
+            func.count(models.FactFlightSession.session_id).label("total_flights"),
+            func.count(func.distinct(models.FactFlightSession.aircraft_id)).label("unique_aircraft"),
+            func.count(func.distinct(models.FactFlightSession.operator_id)).label("unique_operators"),
+            func.sum(models.FactFlightSession.total_distance_km).label("total_distance_km"),
+            func.avg(
+                func.extract("epoch", models.FactFlightSession.last_seen_ts - models.FactFlightSession.first_seen_ts)
+            ).label("avg_duration_s")
+        ).select_from(q.subquery()).one()
+
+        if agg_result.total_flights == 0:
+            return None
+
+        # 2. Top Routes Aggregation
+        DepGeo = aliased(models.DimGeography, name="dep_geo")
+        ArrGeo = aliased(models.DimGeography, name="arr_geo")
+        
+        routes_q = (
+            db.query(
+                DepGeo.icao_code.label("departure"),
+                ArrGeo.icao_code.label("arrival"),
+                func.count(models.FactFlightSession.session_id).label("flight_count")
+            )
+            .select_from(q.subquery())
+            .join(DepGeo, models.FactFlightSession.dep_airport_id == DepGeo.id)
+            .join(ArrGeo, models.FactFlightSession.arr_airport_id == ArrGeo.id)
+            .group_by(DepGeo.icao_code, ArrGeo.icao_code)
+            .order_by(desc("flight_count"))
+            .limit(5)
+        )
+        
+        top_routes = [
+            {"departure": r.departure, "arrival": r.arrival, "flight_count": r.flight_count}
+            for r in routes_q.all()
+        ]
+
+        return {
+            "total_flights": agg_result.total_flights,
+            "unique_aircraft": agg_result.unique_aircraft,
+            "unique_operators": agg_result.unique_operators,
+            "total_distance_km": float(agg_result.total_distance_km) if agg_result.total_distance_km else None,
+            "avg_duration_min": round(float(agg_result.avg_duration_s) / 60, 1) if agg_result.avg_duration_s else None,
+            "top_routes": top_routes
+        }
 
 
 # ═════════════════════════════════════════════════════════════════════════════
