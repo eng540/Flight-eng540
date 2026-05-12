@@ -1,16 +1,15 @@
 """
-Historical Engine API — v1.0 (TIER 3 New)
+Historical Engine API — v1.1 (TIER 4 PART D — Aggregation Fix)
 Prefix: /api/v1/history
 
 ENDPOINTS:
   POST /api/v1/history/query   ← multi-dimensional history query
   GET  /api/v1/history/export  ← CSV export of history results
 
-Evidence: business requirement
-  GET /api/v1/history/query
-  POST /api/v1/history/export
-  "Must support querying by: Aircraft | Airport | Country | Airline | Region"
-  "With date range filtering + aggregated insights"
+CHANGES FROM v1.0:
+  [FIX] Removed App-Level Aggregation on paginated data.
+        Now calls `FlightQueryCRUD.get_history_aggregations` to compute 
+        accurate stats across the ENTIRE dataset matching the query.
 """
 import io
 import csv
@@ -22,7 +21,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.crud import FlightQueryCRUD, AnalyticsCRUD
+from app.crud import FlightQueryCRUD
 from app.schemas import HistoryQueryRequest, HistoryQueryResponse, HistoryAggregations
 
 router = APIRouter(prefix="/api/v1/history", tags=["history-v1"])
@@ -45,36 +44,24 @@ def query_history(
 
     Returns paginated sessions + aggregated insights (totals, distances, top routes).
     """
+    # 1. Fetch Paginated Data
     sessions, total = FlightQueryCRUD.query_history(db, request)
     pages = math.ceil(total / request.page_size) if request.page_size else 1
 
-    # Compute lightweight aggregations on the returned page
-    unique_aircraft  = len({s.aircraft_id for s in sessions if s.aircraft_id})
-    unique_operators = len({s.operator_id  for s in sessions if s.operator_id})
-    total_distance   = sum(
-        s.total_distance_km for s in sessions if s.total_distance_km
-    )
+    # 2. Fetch Accurate Aggregations (Database-Level)
+    # FIX: This replaces the old logic that aggregated only the 50 returned sessions.
+    agg_data = FlightQueryCRUD.get_history_aggregations(db, request)
 
-    # Duration average (seconds → minutes)
-    durations = [
-        (s.last_seen_ts - s.first_seen_ts).total_seconds() / 60
-        for s in sessions
-        if s.first_seen_ts and s.last_seen_ts
-    ]
-    avg_duration = round(sum(durations) / len(durations), 1) if durations else None
-
-    # Top routes from current page
-    route_counter: dict = {}
-    for s in sessions:
-        dep = s.dep_airport.icao_code if s.dep_airport else None
-        arr = s.arr_airport.icao_code if s.arr_airport else None
-        if dep and arr:
-            key = (dep, arr)
-            route_counter[key] = route_counter.get(key, 0) + 1
-    top_routes = [
-        {"departure": k[0], "arrival": k[1], "flight_count": v}
-        for k, v in sorted(route_counter.items(), key=lambda x: -x[1])[:5]
-    ]
+    aggregations = None
+    if agg_data:
+        aggregations = HistoryAggregations(
+            total_flights=agg_data["total_flights"],
+            unique_aircraft=agg_data["unique_aircraft"],
+            unique_operators=agg_data["unique_operators"],
+            total_distance_km=agg_data["total_distance_km"],
+            avg_duration_min=agg_data["avg_duration_min"],
+            top_routes=agg_data["top_routes"],
+        )
 
     from app.api.flights import _session_to_dict
     return HistoryQueryResponse(
@@ -85,14 +72,7 @@ def query_history(
         page_size=request.page_size,
         pages=pages,
         data=[_session_to_dict(s) for s in sessions],
-        aggregations=HistoryAggregations(
-            total_flights=total,
-            unique_aircraft=unique_aircraft,
-            unique_operators=unique_operators,
-            total_distance_km=round(total_distance, 1) if total_distance else None,
-            avg_duration_min=avg_duration,
-            top_routes=top_routes,
-        ),
+        aggregations=aggregations,
     )
 
 
@@ -102,12 +82,11 @@ def export_history(
     entity_id:   str           = Query(..., description="معرف الكيان"),
     date_from:   Optional[str] = Query(None, description="YYYY-MM-DD"),
     date_to:     Optional[str] = Query(None, description="YYYY-MM-DD"),
-    max_rows:    int           = Query(5000, ge=1, le=50000),
+    max_rows:    int           = Query(50000, ge=1, le=50000), # FIX: Increased max_rows to 50,000 for large exports
     db: Session = Depends(get_db),
 ):
     """
     Export historical query results as downloadable CSV.
-    Evidence: business requirement POST /api/v1/history/export
     """
     from app.schemas import HistoryQueryRequest
 
