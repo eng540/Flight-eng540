@@ -1,15 +1,15 @@
 """
-Enterprise CRUD Operations (v6.4 — Database-Level Aggregations Added)
+Enterprise CRUD Operations (v6.5 — Analytics Depth & Time-Series Added)
 Compliant with Aviation Physics, State Machines, and FR24 OpenAPI spec.
 
-CHANGES FROM v6.3:
-  [NEW] FlightQueryCRUD.get_history_aggregations:
-        - Added OLAP-style aggregations to compute accurate stats (total flights, 
-          unique aircraft, total distance, etc.) across the ENTIRE dataset matching 
-          the query, solving the "Paginated Aggregation Bug".
+CHANGES FROM v6.4:
+  [FIX] AnalyticsCRUD.get_period_summary (formerly get_daily_summary):
+        - Now accepts `date_from` and `date_to` to aggregate stats over any time range.
+  [NEW] AnalyticsCRUD.get_time_distribution:
+        - Added OLAP query to group flights by hour of the day (Time-Series analysis).
 """
 from sqlalchemy.orm import Session, joinedload, aliased
-from sqlalchemy import func, and_, or_, desc, case
+from sqlalchemy import func, and_, or_, desc, case, extract
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, OperationalError
 from typing import List, Optional, Dict, Any, Tuple
@@ -691,14 +691,14 @@ class FlightQueryCRUD:
         request: schemas.HistoryQueryRequest,
     ) -> Optional[Dict[str, Any]]:
         """
-        NEW: Computes accurate aggregations across the ENTIRE dataset matching the query,
+        Computes accurate aggregations across the ENTIRE dataset matching the query,
         not just the paginated subset.
         """
         q = FlightQueryCRUD._build_history_base_query(db, request)
         if q is None:
             return None
 
-        # 1. Core Aggregations (Total flights, Unique Aircraft, Unique Operators, Total Distance)
+        # 1. Core Aggregations
         agg_result = db.query(
             func.count(models.FactFlightSession.session_id).label("total_flights"),
             func.count(func.distinct(models.FactFlightSession.aircraft_id)).label("unique_aircraft"),
@@ -835,50 +835,46 @@ class AnalyticsCRUD:
         ]
 
     @staticmethod
-    def get_daily_summary(db: Session, date_str: str) -> Dict[str, Any]:
-        try:
-            day_start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        except ValueError:
-            day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        day_end = day_start + timedelta(days=1)
-
-        agg = (
-            db.query(
-                func.count(models.FactFlightSession.session_id).label("total_flights"),
-                func.sum(case(
-                    (models.FactFlightSession.flight_status == "active", 1), else_=0
-                )).label("active_flights"),
-                func.sum(case(
-                    (models.FactFlightSession.flight_status == "landed", 1), else_=0
-                )).label("landed_flights"),
-                func.count(
-                    func.distinct(models.FactFlightSession.aircraft_id)
-                ).label("unique_aircraft"),
-                func.count(
-                    func.distinct(models.FactFlightSession.operator_id)
-                ).label("unique_operators"),
-            )
-            .filter(
-                models.FactFlightSession.first_seen_ts >= day_start,
-                models.FactFlightSession.first_seen_ts <  day_end,
-            )
-            .one()
+    def get_period_summary(db: Session, date_from: Optional[str] = None, date_to: Optional[str] = None) -> Dict[str, Any]:
+        """
+        FIX: Renamed from get_daily_summary. Now accepts a date range to aggregate stats over any period.
+        """
+        q = db.query(
+            func.count(models.FactFlightSession.session_id).label("total_flights"),
+            func.sum(case((models.FactFlightSession.flight_status == "active", 1), else_=0)).label("active_flights"),
+            func.sum(case((models.FactFlightSession.flight_status == "landed", 1), else_=0)).label("landed_flights"),
+            func.count(func.distinct(models.FactFlightSession.aircraft_id)).label("unique_aircraft"),
+            func.count(func.distinct(models.FactFlightSession.operator_id)).label("unique_operators"),
         )
+        q = _apply_date_filter_session(q, date_from, date_to)
+        agg = q.one()
 
-        emergency_events = (
-            db.query(func.count(models.FactAviationEvent.id))
-            .filter(
-                models.FactAviationEvent.event_category == "EMERGENCY",
-                models.FactAviationEvent.timestamp >= day_start,
-                models.FactAviationEvent.timestamp <  day_end,
-            )
-            .scalar() or 0
+        events_q = db.query(func.count(models.FactAviationEvent.id)).filter(
+            models.FactAviationEvent.event_category == "EMERGENCY"
         )
+        # Apply date filter to events manually since it uses `timestamp` not `first_seen_ts`
+        if date_from:
+            try:
+                dt_f = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                events_q = events_q.filter(models.FactAviationEvent.timestamp >= dt_f)
+            except ValueError: pass
+        if date_to:
+            try:
+                dt_t = datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
+                events_q = events_q.filter(models.FactAviationEvent.timestamp < dt_t)
+            except ValueError: pass
+            
+        emergency_events = events_q.scalar() or 0
+        top_routes = AnalyticsCRUD.get_top_routes(db, limit=5, date_from=date_from, date_to=date_to)
 
-        top_routes = AnalyticsCRUD.get_top_routes(db, limit=5, date_from=date_str, date_to=date_str)
+        # Determine label
+        date_label = "كل الأوقات"
+        if date_from and date_to: date_label = f"{date_from} إلى {date_to}"
+        elif date_from: date_label = f"من {date_from}"
+        elif date_to: date_label = f"حتى {date_to}"
 
         return {
-            "date":             date_str,
+            "date":             date_label,
             "total_flights":    agg.total_flights    or 0,
             "active_flights":   int(agg.active_flights  or 0),
             "landed_flights":   int(agg.landed_flights  or 0),
@@ -887,6 +883,27 @@ class AnalyticsCRUD:
             "unique_operators": agg.unique_operators or 0,
             "top_routes":       top_routes,
         }
+
+    @staticmethod
+    def get_time_distribution(db: Session, date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        NEW: Time-Series Analysis. Groups flights by the hour of the day they were first seen.
+        """
+        q = db.query(
+            extract('hour', models.FactFlightSession.first_seen_ts).label('hour'),
+            func.count(models.FactFlightSession.session_id).label('flight_count')
+        )
+        q = _apply_date_filter_session(q, date_from, date_to)
+        
+        rows = q.group_by('hour').order_by('hour').all()
+        
+        # Ensure all 24 hours are represented, even if 0
+        distribution = {i: 0 for i in range(24)}
+        for r in rows:
+            if r.hour is not None:
+                distribution[int(r.hour)] = r.flight_count
+                
+        return [{"hour": h, "flight_count": c} for h, c in distribution.items()]
 
     @staticmethod
     def get_airline_performance(
