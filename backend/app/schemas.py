@@ -1,6 +1,11 @@
 """
-Enterprise Pydantic Schemas (v3.5 — Multi-Source Ready + Fixes)
+Enterprise Pydantic Schemas (v3.6 — Export Limit Fix)
 Strict validation and typing for the Snowflake Architecture.
+
+CHANGES FROM v3.5:
+  [FIX] HistoryQueryRequest: Increased `page_size` upper limit (`le`) from 500 to 50000.
+        This resolves the Pydantic ValidationError during CSV exports which request 
+        up to 50,000 rows at once.
 """
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional, List, Any, Dict
@@ -298,7 +303,8 @@ class HistoryQueryRequest(BaseModel):
     date_from:   Optional[str] = Field(None, description="YYYY-MM-DD")
     date_to:     Optional[str] = Field(None, description="YYYY-MM-DD inclusive")
     page:        int = Field(1, ge=1)
-    page_size:   int = Field(50, ge=1, le=500)
+    # 🚨 FIX: Increased upper limit from 500 to 50000 to allow large CSV exports
+    page_size:   int = Field(50, ge=1, le=50000)
 
 class HistoryAggregations(BaseModel):
     total_flights:      int
@@ -340,7 +346,7 @@ class HealthCheck(BaseModel):
     status:    str
     timestamp: datetime
     database:  str
-    version:   str = "3.5.0-MultiSource"
+    version:   str = "3.6.0-ExportFix"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
