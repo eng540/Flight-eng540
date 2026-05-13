@@ -1,11 +1,11 @@
 /**
- * AnalyticsSection.tsx — v5.0 (Enterprise Analytics & Time-Series)
+ * AnalyticsSection.tsx — v6.0 (Data Liberation & Deep Filtering)
  *
  * CHANGES:
- * - Fully integrated with the new backend OLAP queries.
- * - Date filters now correctly apply to the Summary Cards as well as charts.
- * - Added a new Time-Series AreaChart to show flight distribution by hour (Peak Hours).
- * - Improved UI styling for a more professional Business Intelligence feel.
+ * - Removed hardcoded `.slice()` from tables. Data is now fully accessible.
+ * - Added Pagination controls (Next/Prev) for all data tables.
+ * - Added Deep Filters (Operator, Airport, Region) alongside Date filters.
+ * - Fixed Timezone issue in Time Distribution chart (UTC -> Local Time).
  */
 import { useState, useEffect, useCallback } from 'react';
 import {
@@ -15,13 +15,17 @@ import { Button }  from '@/components/ui/button';
 import { Input }   from '@/components/ui/input';
 import { Label }   from '@/components/ui/label';
 import {
+  Select, SelectContent, SelectItem,
+  SelectTrigger, SelectValue,
+} from '@/components/ui/select';
+import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
   CartesianGrid, Cell, PieChart, Pie, Legend, AreaChart, Area
 } from 'recharts';
-import { analyticsV1Api } from '@/api/client';
+import { analyticsV1Api, regionsApi } from '@/api/client';
 import type {
   RouteStats, AirportStats,
-  AirlinePerformanceItem, DailySummary,
+  AirlinePerformanceItem, DailySummary, GeoRegion
 } from '@/types';
 
 const COLORS = [
@@ -30,87 +34,191 @@ const COLORS = [
 ];
 
 export function AnalyticsSection() {
+  // Filters State
   const [dateFrom,   setDateFrom]   = useState('');
   const [dateTo,     setDateTo]     = useState('');
+  const [operatorIcao, setOperatorIcao] = useState('');
+  const [airportIcao,  setAirportIcao]  = useState('');
+  const [regionKey,    setRegionKey]    = useState('all');
+  const [regions,      setRegions]      = useState<GeoRegion[]>([]);
   
+  // Data State
   const [topAirports, setTopAirports] = useState<AirportStats[]>([]);
   const [topRoutes,   setTopRoutes]   = useState<RouteStats[]>([]);
   const [airlines,    setAirlines]    = useState<AirlinePerformanceItem[]>([]);
   const [dailySummary, setDailySummary] = useState<DailySummary | null>(null);
-  const [timeDist,    setTimeDist]    = useState<{hour: number, flight_count: number}[]>([]);
+  const [timeDist,    setTimeDist]    = useState<{hour: number, flight_count: number, localHourLabel: string}[]>([]);
   
+  // Pagination State
+  const [routesPage, setRoutesPage] = useState(1);
+  const [routesPages, setRoutesPages] = useState(1);
+  const [airportsPage, setAirportsPage] = useState(1);
+  const [airportsPages, setAirportsPages] = useState(1);
+  const [airlinesPage, setAirlinesPage] = useState(1);
+  const [airlinesPages, setAirlinesPages] = useState(1);
+
   const [loading,     setLoading]     = useState(false);
   const [activeChart, setActiveChart] = useState<'time'|'routes'|'airports'|'airlines'>('time');
 
+  // Load Regions on mount
+  useEffect(() => {
+    regionsApi.listRegions().then(setRegions).catch(console.error);
+  }, []);
+
   // ── Params builder ────────────────────────────────────────────────────────
-  const buildParams = useCallback(() => {
-    const p: { date_from?: string; date_to?: string } = {};
+  const buildParams = useCallback((page = 1, limit = 10) => {
+    const p: Record<string, any> = { page, limit };
     if (dateFrom) p.date_from = dateFrom;
     if (dateTo)   p.date_to   = dateTo;
+    if (operatorIcao) p.operator_icao = operatorIcao.trim().toUpperCase();
+    if (airportIcao) {
+      // If user enters an airport, we apply it to both dep and arr to get all traffic
+      p.dep_icao = airportIcao.trim().toUpperCase();
+      p.arr_icao = airportIcao.trim().toUpperCase();
+    }
+    if (regionKey && regionKey !== 'all') p.region_key = regionKey;
     return p;
-  }, [dateFrom, dateTo]);
+  }, [dateFrom, dateTo, operatorIcao, airportIcao, regionKey]);
 
+  // ── Main Analysis Runner ──────────────────────────────────────────────────
   const runAnalysis = useCallback(async () => {
     setLoading(true);
-    const p = buildParams();
     try {
-      const [airports, routes, airlinesRes, daily, timeRes] = await Promise.all([
-        analyticsV1Api.getBusiestAirports({ limit: 15, ...p }),
-        analyticsV1Api.getTopRoutes({ limit: 20, ...p }),
-        analyticsV1Api.getAirlinePerformance({ ...p, page_size: 10 }),
-        // FIX: Now passing the full date range to the summary endpoint
-        analyticsV1Api.getDailySummary(dateTo || undefined), // Using the legacy wrapper that now accepts range in backend
-        // NEW: Time distribution endpoint
-        import('@/api/client').then(m => m.default.get('/api/v1/analytics/time-distribution', { params: p }).then(r => r.data))
+      // Reset pages on new filter application
+      setRoutesPage(1); setAirportsPage(1); setAirlinesPage(1);
+
+      const pRoutes = buildParams(1, 15);
+      const pAirports = buildParams(1, 15);
+      const pAirlines = buildParams(1, 15);
+      const pGlobal = buildParams(1, 1); // Page/limit ignored by summary/time endpoints
+
+      const [airportsRes, routesRes, airlinesRes, dailyRes, timeRes] = await Promise.all([
+        analyticsV1Api.getBusiestAirports(pAirports),
+        analyticsV1Api.getTopRoutes(pRoutes),
+        analyticsV1Api.getAirlinePerformance(pAirlines),
+        import('@/api/client').then(m => m.default.get('/api/v1/analytics/daily-summary', { params: pGlobal }).then(r => r.data)),
+        import('@/api/client').then(m => m.default.get('/api/v1/analytics/time-distribution', { params: pGlobal }).then(r => r.data))
       ]);
       
-      setTopAirports(airports.data  || []);
-      setTopRoutes(routes.data      || []);
-      setAirlines(airlinesRes.data  || []);
-      setDailySummary(daily         || null);
-      setTimeDist(timeRes.data      || []);
+      setTopAirports(airportsRes.data || []);
+      setAirportsPages(airportsRes.pages || 1);
+
+      setTopRoutes(routesRes.data || []);
+      setRoutesPages(routesRes.pages || 1);
+
+      setAirlines(airlinesRes.data || []);
+      setAirlinesPages(airlinesRes.pages || 1);
+
+      setDailySummary(dailyRes || null);
+
+      // Timezone Correction: Convert UTC hour to Local Browser Hour
+      const localOffset = -(new Date().getTimezoneOffset() / 60);
+      const correctedTimeDist = (timeRes.data || []).map((d: any) => {
+        let localHour = (d.hour + localOffset) % 24;
+        if (localHour < 0) localHour += 24;
+        return {
+          ...d,
+          localHourLabel: `${Math.floor(localHour).toString().padStart(2, '0')}:00`
+        };
+      });
+      // Sort by local hour to keep the chart chronological
+      correctedTimeDist.sort((a: any, b: any) => parseInt(a.localHourLabel) - parseInt(b.localHourLabel));
+      setTimeDist(correctedTimeDist);
+
     } catch (e) { console.error('[Analytics]', e); }
     setLoading(false);
-  }, [buildParams, dateTo]);
+  }, [buildParams]);
 
   // Run once on mount
   useEffect(() => { runAnalysis(); }, []);
 
+  // ── Pagination Handlers ───────────────────────────────────────────────────
+  const loadRoutesPage = async (newPage: number) => {
+    setLoading(true);
+    try {
+      const res = await analyticsV1Api.getTopRoutes(buildParams(newPage, 15));
+      setTopRoutes(res.data || []);
+      setRoutesPage(newPage);
+    } catch (e) { console.error(e); }
+    setLoading(false);
+  };
+
+  const loadAirportsPage = async (newPage: number) => {
+    setLoading(true);
+    try {
+      const res = await analyticsV1Api.getBusiestAirports(buildParams(newPage, 15));
+      setTopAirports(res.data || []);
+      setAirportsPage(newPage);
+    } catch (e) { console.error(e); }
+    setLoading(false);
+  };
+
+  const loadAirlinesPage = async (newPage: number) => {
+    setLoading(true);
+    try {
+      const res = await analyticsV1Api.getAirlinePerformance(buildParams(newPage, 15));
+      setAirlines(res.data || []);
+      setAirlinesPage(newPage);
+    } catch (e) { console.error(e); }
+    setLoading(false);
+  };
+
+  // ── Export Handler ────────────────────────────────────────────────────────
   const handleExport = (type: 'routes' | 'airports' | 'airlines') => {
-    const p: Record<string, string> = {};
-    if (dateFrom) p.date_from = dateFrom;
-    if (dateTo)   p.date_to   = dateTo;
+    const p = buildParams(1, 50000); // Request up to 50k rows for export
     window.open(analyticsV1Api.exportCsvUrl(type, p), '_blank');
   };
 
   return (
     <div className="space-y-8">
 
-      {/* ── Filter bar ──────────────────────────────────────────────────── */}
+      {/* ── Deep Filter Bar ──────────────────────────────────────────────── */}
       <Card className="border-primary/10 shadow-sm">
-        <CardContent className="pt-6">
-          <div className="flex flex-col md:flex-row gap-4 items-end">
-            <div className="space-y-2 flex-1 w-full">
+        <CardHeader className="pb-2">
+          <CardTitle className="text-base flex items-center gap-2">
+            <span>🔍</span> فلاتر التحليلات العميقة
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5 items-end">
+            <div className="space-y-2">
               <Label className="text-xs font-semibold text-muted-foreground">من تاريخ</Label>
               <Input type="date" value={dateFrom} onChange={e => setDateFrom(e.target.value)} className="bg-muted/50" />
             </div>
-            <div className="space-y-2 flex-1 w-full">
+            <div className="space-y-2">
               <Label className="text-xs font-semibold text-muted-foreground">إلى تاريخ</Label>
               <Input type="date" value={dateTo} onChange={e => setDateTo(e.target.value)} className="bg-muted/50" />
             </div>
-            <div className="space-y-2 flex-1 w-full">
-              <Label className="text-xs font-semibold text-muted-foreground">تصدير التقارير (CSV)</Label>
-              <div className="flex gap-2">
-                <Button size="sm" variant="outline" className="flex-1 text-xs" onClick={() => handleExport('routes')}>الطرق</Button>
-                <Button size="sm" variant="outline" className="flex-1 text-xs" onClick={() => handleExport('airports')}>المطارات</Button>
-                <Button size="sm" variant="outline" className="flex-1 text-xs" onClick={() => handleExport('airlines')}>الناقلون</Button>
-              </div>
+            <div className="space-y-2">
+              <Label className="text-xs font-semibold text-muted-foreground">كود الشركة (ICAO)</Label>
+              <Input placeholder="مثال: SVA" value={operatorIcao} onChange={e => setOperatorIcao(e.target.value)} className="bg-muted/50" />
             </div>
-            <div className="w-full md:w-auto">
-              <Button onClick={runAnalysis} disabled={loading} className="w-full md:w-32 shadow-md">
-                {loading ? '⏳ جاري...' : '📈 تطبيق الفلاتر'}
-              </Button>
+            <div className="space-y-2">
+              <Label className="text-xs font-semibold text-muted-foreground">كود المطار (ICAO)</Label>
+              <Input placeholder="مثال: OERK" value={airportIcao} onChange={e => setAirportIcao(e.target.value)} className="bg-muted/50" />
             </div>
+            <div className="space-y-2">
+              <Label className="text-xs font-semibold text-muted-foreground">المنطقة</Label>
+              <Select value={regionKey} onValueChange={setRegionKey}>
+                <SelectTrigger className="bg-muted/50"><SelectValue placeholder="جميع المناطق" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">جميع المناطق</SelectItem>
+                  {regions.map(r => <SelectItem key={r.key} value={r.key}>{r.name_ar}</SelectItem>)}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          
+          <div className="flex flex-col sm:flex-row justify-between items-center mt-6 pt-4 border-t gap-4">
+            <div className="flex gap-2 w-full sm:w-auto">
+              <span className="text-xs font-semibold text-muted-foreground self-center ml-2">تصدير (CSV):</span>
+              <Button size="sm" variant="outline" className="text-xs" onClick={() => handleExport('routes')}>الطرق</Button>
+              <Button size="sm" variant="outline" className="text-xs" onClick={() => handleExport('airports')}>المطارات</Button>
+              <Button size="sm" variant="outline" className="text-xs" onClick={() => handleExport('airlines')}>الناقلون</Button>
+            </div>
+            <Button onClick={runAnalysis} disabled={loading} className="w-full sm:w-40 shadow-md">
+              {loading ? '⏳ جاري...' : '📈 تطبيق الفلاتر'}
+            </Button>
           </div>
         </CardContent>
       </Card>
@@ -160,12 +268,12 @@ export function AnalyticsSection() {
         ))}
       </div>
 
-      {/* ── Time Distribution Chart (NEW) ────────────────────────────────── */}
+      {/* ── Time Distribution Chart ────────────────────────────────── */}
       {activeChart === 'time' && (
         <Card className="border-none shadow-sm">
           <CardHeader>
             <CardTitle className="text-lg">🕒 التوزيع الزمني للرحلات (أوقات الذروة)</CardTitle>
-            <CardDescription>عدد الرحلات المكتشفة موزعة حسب ساعات اليوم (بتوقيت UTC)</CardDescription>
+            <CardDescription>عدد الرحلات المكتشفة موزعة حسب ساعات اليوم (بالتوقيت المحلي لجهازك)</CardDescription>
           </CardHeader>
           <CardContent>
             {timeDist.length === 0 ? <EmptyState /> : (
@@ -178,14 +286,13 @@ export function AnalyticsSection() {
                     </linearGradient>
                   </defs>
                   <XAxis 
-                    dataKey="hour" 
-                    tickFormatter={(h) => `${h}:00`}
+                    dataKey="localHourLabel" 
                     tick={{ fontSize: 12, fontFamily: 'Tajawal' }} 
                   />
                   <YAxis tick={{ fontSize: 12, fontFamily: 'Tajawal' }} />
                   <CartesianGrid strokeDasharray="3 3" vertical={false} strokeOpacity={0.3} />
                   <Tooltip 
-                    labelFormatter={(h) => `الساعة ${h}:00`}
+                    labelFormatter={(h) => `الساعة ${h}`}
                     formatter={(v: number) => [v.toLocaleString('ar'), 'رحلة']}
                     contentStyle={{ fontFamily: 'Tajawal', borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}
                   />
@@ -234,7 +341,7 @@ export function AnalyticsSection() {
             </CardContent>
           </Card>
 
-          {/* Routes table */}
+          {/* Routes table with Pagination */}
           <Card className="lg:col-span-2 border-none shadow-sm">
             <CardContent className="pt-6">
               <div className="rounded-lg border overflow-hidden">
@@ -249,9 +356,9 @@ export function AnalyticsSection() {
                     </tr>
                   </thead>
                   <tbody className="divide-y">
-                    {topRoutes.slice(0, 20).map((r, i) => (
+                    {topRoutes.map((r, i) => (
                       <tr key={i} className="hover:bg-muted/30 transition-colors">
-                        <td className="p-3 text-muted-foreground text-center">{i + 1}</td>
+                        <td className="p-3 text-muted-foreground text-center">{(routesPage - 1) * 15 + i + 1}</td>
                         <td className="p-3 font-mono font-bold text-primary text-lg">{r.departure || '??'}</td>
                         <td className="p-3 text-center text-muted-foreground">✈️</td>
                         <td className="p-3 font-mono font-bold text-primary text-lg">{r.arrival || '??'}</td>
@@ -264,6 +371,14 @@ export function AnalyticsSection() {
                   </tbody>
                 </table>
               </div>
+              {/* Pagination Controls */}
+              {routesPages > 1 && (
+                <div className="flex items-center justify-between mt-4">
+                  <Button variant="outline" size="sm" disabled={routesPage <= 1 || loading} onClick={() => loadRoutesPage(routesPage - 1)}>السابق</Button>
+                  <span className="text-sm text-muted-foreground">صفحة {routesPage} من {routesPages}</span>
+                  <Button variant="outline" size="sm" disabled={routesPage >= routesPages || loading} onClick={() => loadRoutesPage(routesPage + 1)}>التالي</Button>
+                </div>
+              )}
             </CardContent>
           </Card>
         </div>
@@ -272,7 +387,6 @@ export function AnalyticsSection() {
       {/* ── Busiest Airports chart ───────────────────────────────────────── */}
       {activeChart === 'airports' && (
         <div className="grid gap-6 lg:grid-cols-2">
-          {/* Bar chart — total movements */}
           <Card className="border-none shadow-sm">
             <CardHeader>
               <CardTitle className="text-lg">🛫 إجمالي الحركة في المطارات</CardTitle>
@@ -305,7 +419,6 @@ export function AnalyticsSection() {
             </CardContent>
           </Card>
 
-          {/* Pie chart */}
           <Card className="border-none shadow-sm">
             <CardHeader>
               <CardTitle className="text-lg">🥧 الحصة السوقية للمطارات</CardTitle>
@@ -342,17 +455,17 @@ export function AnalyticsSection() {
             </CardContent>
           </Card>
 
-          {/* Airport ranking list */}
+          {/* Airport ranking list with Pagination */}
           <Card className="lg:col-span-2 border-none shadow-sm">
             <CardContent className="pt-6">
-              <div className="space-y-4 max-h-96 overflow-y-auto pr-2 custom-scrollbar">
-                {topAirports.slice(0, 15).map((a, i) => {
+              <div className="space-y-4">
+                {topAirports.map((a, i) => {
                   const pct = topAirports[0]?.flight_count
                     ? (a.flight_count / topAirports[0].flight_count) * 100 : 0;
                   return (
                     <div key={a.airport_icao} className="flex items-center gap-4 p-2 hover:bg-muted/50 rounded-lg transition-colors">
                       <div className="flex items-center justify-center w-8 h-8 rounded-full bg-muted text-muted-foreground font-bold text-sm">
-                        {i + 1}
+                        {(airportsPage - 1) * 15 + i + 1}
                       </div>
                       <span className="font-mono text-lg font-bold text-primary w-16">{a.airport_icao}</span>
                       <div className="flex-1">
@@ -370,6 +483,14 @@ export function AnalyticsSection() {
                 })}
                 {topAirports.length === 0 && <EmptyState />}
               </div>
+              {/* Pagination Controls */}
+              {airportsPages > 1 && (
+                <div className="flex items-center justify-between mt-6 pt-4 border-t">
+                  <Button variant="outline" size="sm" disabled={airportsPage <= 1 || loading} onClick={() => loadAirportsPage(airportsPage - 1)}>السابق</Button>
+                  <span className="text-sm text-muted-foreground">صفحة {airportsPage} من {airportsPages}</span>
+                  <Button variant="outline" size="sm" disabled={airportsPage >= airportsPages || loading} onClick={() => loadAirportsPage(airportsPage + 1)}>التالي</Button>
+                </div>
+              )}
             </CardContent>
           </Card>
         </div>
@@ -378,7 +499,6 @@ export function AnalyticsSection() {
       {/* ── Airline Performance ──────────────────────────────────────────── */}
       {activeChart === 'airlines' && (
         <div className="grid gap-6 lg:grid-cols-2">
-          {/* Bar chart — total flights */}
           <Card className="border-none shadow-sm">
             <CardHeader>
               <CardTitle className="text-lg">✈️ حجم عمليات الناقلين</CardTitle>
@@ -387,7 +507,7 @@ export function AnalyticsSection() {
               {airlines.length === 0 ? <EmptyState /> : (
                 <ResponsiveContainer width="100%" height={320}>
                   <BarChart
-                    data={airlines.map(a => ({
+                    data={airlines.slice(0, 15).map(a => ({
                       ناقل:      a.operator_icao,
                       'رحلات نشطة':  a.active_flights,
                       'رحلات كاملة': a.total_flights - a.active_flights,
@@ -412,7 +532,6 @@ export function AnalyticsSection() {
             </CardContent>
           </Card>
 
-          {/* Line chart — avg duration */}
           <Card className="border-none shadow-sm">
             <CardHeader>
               <CardTitle className="text-lg">⏱️ متوسط مدة الرحلة (دقيقة)</CardTitle>
@@ -422,6 +541,7 @@ export function AnalyticsSection() {
                 <ResponsiveContainer width="100%" height={320}>
                   <BarChart
                     data={airlines
+                      .slice(0, 15)
                       .filter(a => a.avg_flight_duration_min != null)
                       .map(a => ({
                         ناقل: a.operator_icao,
@@ -445,7 +565,7 @@ export function AnalyticsSection() {
             </CardContent>
           </Card>
 
-          {/* Airline table */}
+          {/* Airline table with Pagination */}
           <Card className="lg:col-span-2 border-none shadow-sm">
             <CardContent className="pt-6">
               <div className="rounded-lg border overflow-auto">
@@ -464,7 +584,7 @@ export function AnalyticsSection() {
                   <tbody className="divide-y">
                     {airlines.map((a, i) => (
                       <tr key={a.operator_icao} className="hover:bg-muted/30 transition-colors">
-                        <td className="p-3 text-center text-muted-foreground">{i + 1}</td>
+                        <td className="p-3 text-center text-muted-foreground">{(airlinesPage - 1) * 15 + i + 1}</td>
                         <td className="p-3 font-mono font-bold text-primary text-base">{a.operator_icao}</td>
                         <td className="p-3 text-muted-foreground font-medium">{a.operator_name || '—'}</td>
                         <td className="p-3 font-bold text-lg text-left">{a.total_flights.toLocaleString('ar')}</td>
@@ -485,6 +605,14 @@ export function AnalyticsSection() {
                   </tbody>
                 </table>
               </div>
+              {/* Pagination Controls */}
+              {airlinesPages > 1 && (
+                <div className="flex items-center justify-between mt-4">
+                  <Button variant="outline" size="sm" disabled={airlinesPage <= 1 || loading} onClick={() => loadAirlinesPage(airlinesPage - 1)}>السابق</Button>
+                  <span className="text-sm text-muted-foreground">صفحة {airlinesPage} من {airlinesPages}</span>
+                  <Button variant="outline" size="sm" disabled={airlinesPage >= airlinesPages || loading} onClick={() => loadAirlinesPage(airlinesPage + 1)}>التالي</Button>
+                </div>
+              )}
             </CardContent>
           </Card>
         </div>
