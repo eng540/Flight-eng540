@@ -1,14 +1,18 @@
 """
-Analytics API Endpoints — v4.1 (Time-Series & Date Range Fix)
+Analytics API Endpoints — v4.2 (Deep Filtering & Pagination Enabled)
 Prefix: /api/v1/analytics
 
 ENDPOINTS:
   GET /api/v1/analytics/top-routes
   GET /api/v1/analytics/busiest-airports
-  GET /api/v1/analytics/daily-summary         ← FIX: Now accepts date_from & date_to
-  GET /api/v1/analytics/time-distribution     ← NEW: Hourly heatmap data
+  GET /api/v1/analytics/daily-summary
+  GET /api/v1/analytics/time-distribution
   GET /api/v1/analytics/airline-performance
   GET /api/v1/analytics/export-csv
+
+CHANGES FROM v4.1:
+  [ENHANCEMENT] All endpoints now accept deep filters: operator_icao, dep_icao, arr_icao, region_key.
+  [ENHANCEMENT] top-routes and busiest-airports now support `page` parameter for full pagination.
 """
 import io
 import csv
@@ -44,13 +48,22 @@ legacy_router = APIRouter(prefix="/analytics", tags=["analytics-legacy"])
 @router.get("/top-routes", summary="أكثر الطرق ازدحاماً")
 @legacy_router.get("/top_routes", include_in_schema=False)
 def get_top_routes(
-    limit:     int           = Query(10, ge=1, le=100),
-    date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
-    date_to:   Optional[str] = Query(None, description="YYYY-MM-DD"),
+    page:          int           = Query(1, ge=1),
+    limit:         int           = Query(10, ge=1, le=100),
+    date_from:     Optional[str] = Query(None, description="YYYY-MM-DD"),
+    date_to:       Optional[str] = Query(None, description="YYYY-MM-DD"),
+    operator_icao: Optional[str] = Query(None, description="كود الناقل ICAO"),
+    dep_icao:      Optional[str] = Query(None, description="مطار المغادرة ICAO"),
+    arr_icao:      Optional[str] = Query(None, description="مطار الوصول ICAO"),
+    region_key:    Optional[str] = Query(None, description="مفتاح المنطقة"),
     db: Session = Depends(get_db),
 ):
-    routes = AnalyticsCRUD.get_top_routes(db, limit=limit, date_from=date_from, date_to=date_to)
-    return {"total": len(routes), "data": routes}
+    total, routes = AnalyticsCRUD.get_top_routes(
+        db, limit=limit, page=page, date_from=date_from, date_to=date_to,
+        operator_icao=operator_icao, dep_icao=dep_icao, arr_icao=arr_icao, region_key=region_key
+    )
+    pages = math.ceil(total / limit) if limit else 1
+    return {"total": total, "page": page, "pages": pages, "data": routes}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -60,49 +73,63 @@ def get_top_routes(
 @router.get("/busiest-airports", summary="أكثر المطارات ازدحاماً")
 @legacy_router.get("/top_airports", include_in_schema=False)
 def get_busiest_airports(
-    limit:     int           = Query(15, ge=1, le=100),
-    date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
-    date_to:   Optional[str] = Query(None, description="YYYY-MM-DD"),
+    page:          int           = Query(1, ge=1),
+    limit:         int           = Query(15, ge=1, le=100),
+    date_from:     Optional[str] = Query(None, description="YYYY-MM-DD"),
+    date_to:       Optional[str] = Query(None, description="YYYY-MM-DD"),
+    operator_icao: Optional[str] = Query(None, description="كود الناقل ICAO"),
+    dep_icao:      Optional[str] = Query(None, description="مطار المغادرة ICAO"),
+    arr_icao:      Optional[str] = Query(None, description="مطار الوصول ICAO"),
+    region_key:    Optional[str] = Query(None, description="مفتاح المنطقة"),
     db: Session = Depends(get_db),
 ):
-    airports = AnalyticsCRUD.get_busiest_airports(
-        db, limit=limit, date_from=date_from, date_to=date_to
+    total, airports = AnalyticsCRUD.get_busiest_airports(
+        db, limit=limit, page=page, date_from=date_from, date_to=date_to,
+        operator_icao=operator_icao, dep_icao=dep_icao, arr_icao=arr_icao, region_key=region_key
     )
-    return {"total": len(airports), "data": airports}
+    pages = math.ceil(total / limit) if limit else 1
+    return {"total": total, "page": page, "pages": pages, "data": airports}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Period Summary (formerly Daily Summary)
+# Period Summary
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/daily-summary", summary="ملخص الرحلات للفترة المحددة")
 def get_daily_summary(
-    date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
-    date_to:   Optional[str] = Query(None, description="YYYY-MM-DD"),
+    date_from:     Optional[str] = Query(None, description="YYYY-MM-DD"),
+    date_to:       Optional[str] = Query(None, description="YYYY-MM-DD"),
+    operator_icao: Optional[str] = Query(None, description="كود الناقل ICAO"),
+    dep_icao:      Optional[str] = Query(None, description="مطار المغادرة ICAO"),
+    arr_icao:      Optional[str] = Query(None, description="مطار الوصول ICAO"),
+    region_key:    Optional[str] = Query(None, description="مفتاح المنطقة"),
     db: Session = Depends(get_db),
 ):
-    """
-    FIX: Now accepts a date range instead of a single day.
-    """
-    summary = AnalyticsCRUD.get_period_summary(db, date_from=date_from, date_to=date_to)
+    summary = AnalyticsCRUD.get_period_summary(
+        db, date_from=date_from, date_to=date_to,
+        operator_icao=operator_icao, dep_icao=dep_icao, arr_icao=arr_icao, region_key=region_key
+    )
     return summary
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Time Distribution (NEW)
+# Time Distribution
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/time-distribution", summary="التوزيع الزمني للرحلات (حسب ساعات اليوم)")
 def get_time_distribution(
-    date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
-    date_to:   Optional[str] = Query(None, description="YYYY-MM-DD"),
+    date_from:     Optional[str] = Query(None, description="YYYY-MM-DD"),
+    date_to:       Optional[str] = Query(None, description="YYYY-MM-DD"),
+    operator_icao: Optional[str] = Query(None, description="كود الناقل ICAO"),
+    dep_icao:      Optional[str] = Query(None, description="مطار المغادرة ICAO"),
+    arr_icao:      Optional[str] = Query(None, description="مطار الوصول ICAO"),
+    region_key:    Optional[str] = Query(None, description="مفتاح المنطقة"),
     db: Session = Depends(get_db),
 ):
-    """
-    NEW: Returns flight counts grouped by hour of the day (0-23).
-    Used for Heatmaps and Peak Hour analysis.
-    """
-    distribution = AnalyticsCRUD.get_time_distribution(db, date_from=date_from, date_to=date_to)
+    distribution = AnalyticsCRUD.get_time_distribution(
+        db, date_from=date_from, date_to=date_to,
+        operator_icao=operator_icao, dep_icao=dep_icao, arr_icao=arr_icao, region_key=region_key
+    )
     return {"data": distribution}
 
 
@@ -112,18 +139,19 @@ def get_time_distribution(
 
 @router.get("/airline-performance", summary="أداء شركات الطيران")
 def get_airline_performance(
-    date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
-    date_to:   Optional[str] = Query(None, description="YYYY-MM-DD"),
-    page:      int           = Query(1,  ge=1),
-    page_size: int           = Query(20, ge=1, le=200),
+    page:          int           = Query(1,  ge=1),
+    page_size:     int           = Query(20, ge=1, le=200),
+    date_from:     Optional[str] = Query(None, description="YYYY-MM-DD"),
+    date_to:       Optional[str] = Query(None, description="YYYY-MM-DD"),
+    operator_icao: Optional[str] = Query(None, description="كود الناقل ICAO"),
+    dep_icao:      Optional[str] = Query(None, description="مطار المغادرة ICAO"),
+    arr_icao:      Optional[str] = Query(None, description="مطار الوصول ICAO"),
+    region_key:    Optional[str] = Query(None, description="مفتاح المنطقة"),
     db: Session = Depends(get_db),
 ):
     total, data = AnalyticsCRUD.get_airline_performance(
-        db,
-        date_from=date_from,
-        date_to=date_to,
-        page=page,
-        page_size=page_size,
+        db, limit=page_size, page=page, date_from=date_from, date_to=date_to,
+        operator_icao=operator_icao, dep_icao=dep_icao, arr_icao=arr_icao, region_key=region_key
     )
     pages = math.ceil(total / page_size) if page_size else 1
     return AirlinePerformanceResponse(
@@ -138,24 +166,32 @@ def get_airline_performance(
 
 @router.get("/export-csv", summary="تصدير البيانات التحليلية CSV")
 def export_analytics_csv(
-    report_type: str           = Query("routes", description="routes | airports | airlines"),
-    date_from:   Optional[str] = Query(None, description="YYYY-MM-DD"),
-    date_to:     Optional[str] = Query(None, description="YYYY-MM-DD"),
-    limit:       int           = Query(1000, ge=1, le=10000),
+    report_type:   str           = Query("routes", description="routes | airports | airlines"),
+    limit:         int           = Query(1000, ge=1, le=10000),
+    date_from:     Optional[str] = Query(None, description="YYYY-MM-DD"),
+    date_to:       Optional[str] = Query(None, description="YYYY-MM-DD"),
+    operator_icao: Optional[str] = Query(None, description="كود الناقل ICAO"),
+    dep_icao:      Optional[str] = Query(None, description="مطار المغادرة ICAO"),
+    arr_icao:      Optional[str] = Query(None, description="مطار الوصول ICAO"),
+    region_key:    Optional[str] = Query(None, description="مفتاح المنطقة"),
     db: Session = Depends(get_db),
 ):
     output = io.StringIO()
 
     if report_type == "routes":
-        rows = AnalyticsCRUD.get_top_routes(db, limit=limit, date_from=date_from, date_to=date_to)
+        _, rows = AnalyticsCRUD.get_top_routes(
+            db, limit=limit, page=1, date_from=date_from, date_to=date_to,
+            operator_icao=operator_icao, dep_icao=dep_icao, arr_icao=arr_icao, region_key=region_key
+        )
         writer = csv.DictWriter(output, fieldnames=["departure", "arrival", "flight_count"])
         writer.writeheader()
         writer.writerows(rows)
         filename = "top_routes.csv"
 
     elif report_type == "airports":
-        rows = AnalyticsCRUD.get_busiest_airports(
-            db, limit=limit, date_from=date_from, date_to=date_to
+        _, rows = AnalyticsCRUD.get_busiest_airports(
+            db, limit=limit, page=1, date_from=date_from, date_to=date_to,
+            operator_icao=operator_icao, dep_icao=dep_icao, arr_icao=arr_icao, region_key=region_key
         )
         writer = csv.DictWriter(
             output, fieldnames=["airport_icao", "flight_count", "as_departure", "as_arrival"]
@@ -166,7 +202,8 @@ def export_analytics_csv(
 
     elif report_type == "airlines":
         _, rows = AnalyticsCRUD.get_airline_performance(
-            db, date_from=date_from, date_to=date_to, page=1, page_size=limit
+            db, limit=limit, page=1, date_from=date_from, date_to=date_to,
+            operator_icao=operator_icao, dep_icao=dep_icao, arr_icao=arr_icao, region_key=region_key
         )
         writer = csv.DictWriter(output, fieldnames=[
             "operator_icao", "operator_name", "total_flights",
