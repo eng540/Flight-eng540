@@ -1,15 +1,17 @@
 """
-Enterprise CRUD Operations (v6.5 — Analytics Depth & Time-Series Added)
+Enterprise CRUD Operations (v7.0 — Deep Analytics Filtering & Pagination)
 Compliant with Aviation Physics, State Machines, and FR24 OpenAPI spec.
 
 CHANGES FROM v6.4:
-  [FIX] AnalyticsCRUD.get_period_summary (formerly get_daily_summary):
-        - Now accepts `date_from` and `date_to` to aggregate stats over any time range.
-  [NEW] AnalyticsCRUD.get_time_distribution:
-        - Added OLAP query to group flights by hour of the day (Time-Series analysis).
+  [ENHANCEMENT] AnalyticsCRUD:
+        - All methods now accept deep filters (operator_icao, dep_icao, arr_icao, region_key).
+        - get_top_routes & get_busiest_airports now return (total, data) to support Pagination.
+  [FIX] FlightQueryCRUD & AnalyticsCRUD:
+        - Replaced `.subquery()` with `select()` in `in_()` clauses to fix SQLAlchemy 2.0 
+          "Coercing Subquery object into a select()" warnings (ITEM-7.5).
 """
 from sqlalchemy.orm import Session, joinedload, aliased
-from sqlalchemy import func, and_, or_, desc, case, extract
+from sqlalchemy import func, and_, or_, desc, case, extract, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, OperationalError
 from typing import List, Optional, Dict, Any, Tuple
@@ -59,13 +61,11 @@ class DataQualityValidator:
             state_ts  = current_state.last_updated.timestamp()
             time_diff = payload.timestamp - state_ts
 
-            # Exact duplicate
             if (abs(time_diff) < 1
                     and abs(payload.latitude  - current_state.latitude)  < 0.0001
                     and abs(payload.longitude - current_state.longitude) < 0.0001):
                 return False
 
-            # Ghost jump: >50 km in <30 s
             if 0 < time_diff < 30:
                 dist_km = AviationMath.haversine_distance(
                     current_state.latitude, current_state.longitude,
@@ -77,7 +77,6 @@ class DataQualityValidator:
                     )
                     return False
 
-            # Impossible altitude spike
             if (payload.altitude is not None
                     and current_state.altitude_m is not None
                     and abs(payload.altitude - current_state.altitude_m) > 1000
@@ -108,7 +107,6 @@ class EnterpriseDataRouter:
         if not payloads:
             return stats
 
-        # ── Step 1: Bulk Pre-fetch & Cache (Eliminate N+1) ───────────────────
         icao24s = list({p.icao24 for p in payloads})
         
         current_states = {
@@ -133,7 +131,6 @@ class EnterpriseDataRouter:
         geo_cache: Dict[str, int] = {}
         operator_cache: Dict[str, Dict[str, Any]] = {}
 
-        # ── Step 2: Process each radar ping (In-Memory) ───────────────────────
         state_upsert_dicts = []
 
         for payload in payloads:
@@ -145,7 +142,6 @@ class EnterpriseDataRouter:
                         stats["rejected"] += 1
                         continue
 
-                    # Resolve Dimensions
                     dep_id = EnterpriseDataRouter._ensure_geo_safe(db, geo_cache, payload.est_departure_airport)
                     arr_id = EnterpriseDataRouter._ensure_geo_safe(db, geo_cache, payload.est_arrival_airport)
                     op_entry = EnterpriseDataRouter._ensure_operator_safe(db, operator_cache, payload.operator_icao)
@@ -153,7 +149,6 @@ class EnterpriseDataRouter:
                     op_id    = op_entry["id"]   if op_entry else None
                     op_name  = op_entry["name"] if op_entry else None
 
-                    # Aircraft Resolution
                     aircraft = aircraft_cache.get(payload.icao24)
                     if not aircraft:
                         try:
@@ -178,7 +173,6 @@ class EnterpriseDataRouter:
 
                     dt_timestamp = datetime.fromtimestamp(payload.timestamp, tz=timezone.utc)
 
-                    # Session State Machine
                     session = active_sessions.get(payload.icao24)
                     is_moving = payload.velocity and payload.velocity > 50
                     should_open = False
@@ -209,7 +203,6 @@ class EnterpriseDataRouter:
                             ))
                             stats["events"] += 1
 
-                    # Update active session & Add Track
                     if session and session.flight_status == "active":
                         session.last_seen_ts = dt_timestamp
                         if payload.altitude and (session.max_altitude_m is None or payload.altitude > session.max_altitude_m):
@@ -231,7 +224,6 @@ class EnterpriseDataRouter:
                         ))
                         stats["tracks_recorded"] += 1
 
-                    # Emergency squawk
                     if payload.squawk in ("7500", "7600", "7700"):
                         last_sq = current_state.squawk if current_state else None
                         if payload.squawk != last_sq and session:
@@ -242,7 +234,6 @@ class EnterpriseDataRouter:
                             ))
                             stats["events"] += 1
 
-                    # Prepare dict for Atomic Upsert
                     state_upsert_dicts.append({
                         "icao24": payload.icao24,
                         "aircraft_id": aircraft.id,
@@ -275,7 +266,6 @@ class EnterpriseDataRouter:
                 logger.error(f"[Router] Error processing {payload.icao24}: {exc}", exc_info=True)
                 stats["errors"] += 1
 
-        # Flush Sessions and Tracks before Upserting State
         try:
             db.flush()
         except Exception as exc:
@@ -283,7 +273,6 @@ class EnterpriseDataRouter:
             db.rollback()
             return stats
 
-        # ── Step 3: Atomic Upsert for CurrentAircraftState ───────────────────
         if state_upsert_dicts:
             state_upsert_dicts.sort(key=lambda x: x["icao24"])
 
@@ -343,8 +332,6 @@ class EnterpriseDataRouter:
 
         return stats
 
-    # ── Orphaned Session Sweeper (Deadlock Immune) ─────────────────────────
-    
     @staticmethod
     def close_orphaned_sessions(db: Session, timeout_minutes: int = 45) -> int:
         cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=timeout_minutes)
@@ -405,8 +392,6 @@ class EnterpriseDataRouter:
 
         return closed_count
 
-    # ── Safe FK helpers (Handles Concurrent Inserts) ───────────────────────
-
     @staticmethod
     def _ensure_geo_safe(db: Session, cache: Dict[str, int], icao: Optional[str]) -> Optional[int]:
         if not icao: return None
@@ -452,6 +437,50 @@ class EnterpriseDataRouter:
             cache[key] = {"id": op.id, "name": op.name}
             return cache[key]
         return None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE-LEVEL HELPERS (Advanced Filtering)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _apply_advanced_filters_session(
+    q, db: Session, 
+    date_from: Optional[str] = None, date_to: Optional[str] = None,
+    operator_icao: Optional[str] = None, dep_icao: Optional[str] = None,
+    arr_icao: Optional[str] = None, region_key: Optional[str] = None
+):
+    """Applies deep cross-filtering to any FactFlightSession query."""
+    if date_from:
+        try:
+            dt = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            q  = q.filter(models.FactFlightSession.first_seen_ts >= dt)
+        except ValueError: pass
+    if date_to:
+        try:
+            dt = datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
+            q  = q.filter(models.FactFlightSession.first_seen_ts < dt)
+        except ValueError: pass
+        
+    if operator_icao:
+        stmt = select(models.DimOperator.id).where(models.DimOperator.icao_code == operator_icao.upper())
+        q = q.filter(models.FactFlightSession.operator_id.in_(stmt))
+        
+    if dep_icao:
+        stmt = select(models.DimGeography.id).where(models.DimGeography.icao_code == dep_icao.upper())
+        q = q.filter(models.FactFlightSession.dep_airport_id.in_(stmt))
+        
+    if arr_icao:
+        stmt = select(models.DimGeography.id).where(models.DimGeography.icao_code == arr_icao.upper())
+        q = q.filter(models.FactFlightSession.arr_airport_id.in_(stmt))
+        
+    if region_key:
+        stmt = select(models.CurrentAircraftState.session_id).where(
+            models.CurrentAircraftState.region_key == region_key,
+            models.CurrentAircraftState.session_id.isnot(None)
+        )
+        q = q.filter(models.FactFlightSession.session_id.in_(stmt))
+        
+    return q
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -542,30 +571,11 @@ class FlightQueryCRUD:
             q = q.filter(models.FactFlightSession.flight_status == status)
 
         if icao24:
-            sub = db.query(models.DimAircraft.id).filter(
-                models.DimAircraft.icao24 == icao24.lower()
-            ).subquery()
-            q = q.filter(models.FactFlightSession.aircraft_id.in_(sub))
+            stmt = select(models.DimAircraft.id).where(models.DimAircraft.icao24 == icao24.lower())
+            q = q.filter(models.FactFlightSession.aircraft_id.in_(stmt))
 
-        if operator_icao:
-            sub = db.query(models.DimOperator.id).filter(
-                models.DimOperator.icao_code == operator_icao.upper()
-            ).subquery()
-            q = q.filter(models.FactFlightSession.operator_id.in_(sub))
-
-        if dep_icao:
-            sub = db.query(models.DimGeography.id).filter(
-                models.DimGeography.icao_code == dep_icao.upper()
-            ).subquery()
-            q = q.filter(models.FactFlightSession.dep_airport_id.in_(sub))
-
-        if arr_icao:
-            sub = db.query(models.DimGeography.id).filter(
-                models.DimGeography.icao_code == arr_icao.upper()
-            ).subquery()
-            q = q.filter(models.FactFlightSession.arr_airport_id.in_(sub))
-
-        q = _apply_date_filter(q, date_from, date_to)
+        q = _apply_advanced_filters_session(q, db, date_from, date_to, operator_icao, dep_icao, arr_icao, None)
+        
         total  = q.count()
         offset = (page - 1) * page_size
         return q.order_by(desc(models.FactFlightSession.first_seen_ts)).offset(offset).limit(page_size).all(), total
@@ -599,69 +609,46 @@ class FlightQueryCRUD:
             )
             .filter(models.FactFlightSession.aircraft_id == aircraft.id)
         )
-        q = _apply_date_filter(q, date_from, date_to)
+        q = _apply_advanced_filters_session(q, db, date_from, date_to)
         total  = q.count()
         offset = (page - 1) * page_size
         return q.order_by(desc(models.FactFlightSession.first_seen_ts)).offset(offset).limit(page_size).all(), total
 
     @staticmethod
     def _build_history_base_query(db: Session, request: schemas.HistoryQueryRequest):
-        """Helper to build the base query for both data and aggregations."""
         q = db.query(models.FactFlightSession)
         eid   = request.entity_id.strip()
         etype = request.entity_type
 
         if etype == "aircraft":
-            ac = db.query(models.DimAircraft).filter(
-                models.DimAircraft.icao24 == eid.lower()
-            ).first()
-            if not ac:
-                return None
+            ac = db.query(models.DimAircraft).filter(models.DimAircraft.icao24 == eid.lower()).first()
+            if not ac: return None
             q = q.filter(models.FactFlightSession.aircraft_id == ac.id)
+            return _apply_advanced_filters_session(q, db, request.date_from, request.date_to)
 
         elif etype == "airport":
             geo = db.query(models.DimGeography).filter(
-                or_(
-                    models.DimGeography.icao_code == eid.upper(),
-                    models.DimGeography.iata_code == eid.upper(),
-                )
+                or_(models.DimGeography.icao_code == eid.upper(), models.DimGeography.iata_code == eid.upper())
             ).first()
-            if not geo:
-                return None
+            if not geo: return None
             q = q.filter(or_(
                 models.FactFlightSession.dep_airport_id == geo.id,
                 models.FactFlightSession.arr_airport_id == geo.id,
             ))
+            return _apply_advanced_filters_session(q, db, request.date_from, request.date_to)
 
         elif etype == "airline":
-            op = db.query(models.DimOperator).filter(
-                or_(
-                    models.DimOperator.icao_code == eid.upper(),
-                    models.DimOperator.iata_code == eid.upper(),
-                )
-            ).first()
-            if not op:
-                return None
-            q = q.filter(models.FactFlightSession.operator_id == op.id)
+            return _apply_advanced_filters_session(q, db, request.date_from, request.date_to, operator_icao=eid)
 
         elif etype == "country":
-            sub = db.query(models.DimAircraft.id).filter(
-                models.DimAircraft.country_code == eid.upper()
-            ).subquery()
-            q = q.filter(models.FactFlightSession.aircraft_id.in_(sub))
+            stmt = select(models.DimAircraft.id).where(models.DimAircraft.country_code == eid.upper())
+            q = q.filter(models.FactFlightSession.aircraft_id.in_(stmt))
+            return _apply_advanced_filters_session(q, db, request.date_from, request.date_to)
 
         elif etype == "region":
-            sub = (
-                db.query(models.CurrentAircraftState.session_id)
-                .filter(
-                    models.CurrentAircraftState.region_key == eid,
-                    models.CurrentAircraftState.session_id.isnot(None),
-                )
-                .subquery()
-            )
-            q = q.filter(models.FactFlightSession.session_id.in_(sub))
+            return _apply_advanced_filters_session(q, db, request.date_from, request.date_to, region_key=eid)
 
-        return _apply_date_filter(q, request.date_from, request.date_to)
+        return _apply_advanced_filters_session(q, db, request.date_from, request.date_to)
 
     @staticmethod
     def query_history(
@@ -673,7 +660,6 @@ class FlightQueryCRUD:
         if q is None:
             return [], 0
 
-        # Eager load relationships for the paginated data
         q = q.options(
             joinedload(models.FactFlightSession.aircraft),
             joinedload(models.FactFlightSession.operator),
@@ -690,15 +676,10 @@ class FlightQueryCRUD:
         db: Session,
         request: schemas.HistoryQueryRequest,
     ) -> Optional[Dict[str, Any]]:
-        """
-        Computes accurate aggregations across the ENTIRE dataset matching the query,
-        not just the paginated subset.
-        """
         q = FlightQueryCRUD._build_history_base_query(db, request)
         if q is None:
             return None
 
-        # 1. Core Aggregations
         agg_result = db.query(
             func.count(models.FactFlightSession.session_id).label("total_flights"),
             func.count(func.distinct(models.FactFlightSession.aircraft_id)).label("unique_aircraft"),
@@ -712,7 +693,6 @@ class FlightQueryCRUD:
         if agg_result.total_flights == 0:
             return None
 
-        # 2. Top Routes Aggregation
         DepGeo = aliased(models.DimGeography, name="dep_geo")
         ArrGeo = aliased(models.DimGeography, name="arr_geo")
         
@@ -753,11 +733,11 @@ class AnalyticsCRUD:
 
     @staticmethod
     def get_top_routes(
-        db: Session,
-        limit:     int = 10,
-        date_from: Optional[str] = None,
-        date_to:   Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
+        db: Session, limit: int = 10, page: int = 1,
+        date_from: Optional[str] = None, date_to: Optional[str] = None,
+        operator_icao: Optional[str] = None, dep_icao: Optional[str] = None,
+        arr_icao: Optional[str] = None, region_key: Optional[str] = None
+    ) -> Tuple[int, List[Dict[str, Any]]]:
         DepGeo = aliased(models.DimGeography, name="dep_geo")
         ArrGeo = aliased(models.DimGeography, name="arr_geo")
 
@@ -774,71 +754,74 @@ class AnalyticsCRUD:
                 models.FactFlightSession.arr_airport_id.isnot(None),
             )
         )
-        q = _apply_date_filter_session(q, date_from, date_to)
-        rows = (
-            q.group_by(DepGeo.icao_code, ArrGeo.icao_code)
-            .order_by(desc("flight_count"))
-            .limit(limit)
-            .all()
-        )
-        return [
+        q = _apply_advanced_filters_session(q, db, date_from, date_to, operator_icao, dep_icao, arr_icao, region_key)
+        q = q.group_by(DepGeo.icao_code, ArrGeo.icao_code)
+        
+        # Pagination logic
+        total = q.count()
+        offset = (page - 1) * limit
+        rows = q.order_by(desc("flight_count")).offset(offset).limit(limit).all()
+        
+        results = [
             {"departure": r.departure, "arrival": r.arrival, "flight_count": r.flight_count}
             for r in rows
         ]
+        return total, results
 
     @staticmethod
     def get_busiest_airports(
-        db: Session,
-        limit:     int = 10,
-        date_from: Optional[str] = None,
-        date_to:   Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        dep_q = (
-            db.query(
-                models.FactFlightSession.dep_airport_id.label("airport_id"),
-                func.count(models.FactFlightSession.session_id).label("dep_count"),
-            )
-            .filter(models.FactFlightSession.dep_airport_id.isnot(None))
-        )
-        dep_q = _apply_date_filter_session(dep_q, date_from, date_to)
+        db: Session, limit: int = 10, page: int = 1,
+        date_from: Optional[str] = None, date_to: Optional[str] = None,
+        operator_icao: Optional[str] = None, dep_icao: Optional[str] = None,
+        arr_icao: Optional[str] = None, region_key: Optional[str] = None
+    ) -> Tuple[int, List[Dict[str, Any]]]:
+        
+        dep_q = db.query(
+            models.FactFlightSession.dep_airport_id.label("airport_id"),
+            func.count(models.FactFlightSession.session_id).label("dep_count")
+        ).filter(models.FactFlightSession.dep_airport_id.isnot(None))
+        dep_q = _apply_advanced_filters_session(dep_q, db, date_from, date_to, operator_icao, dep_icao, arr_icao, region_key)
         dep_sq = dep_q.group_by(models.FactFlightSession.dep_airport_id).subquery()
 
-        arr_q = (
-            db.query(
-                models.FactFlightSession.arr_airport_id.label("airport_id"),
-                func.count(models.FactFlightSession.session_id).label("arr_count"),
-            )
-            .filter(models.FactFlightSession.arr_airport_id.isnot(None))
-        )
-        arr_q = _apply_date_filter_session(arr_q, date_from, date_to)
+        arr_q = db.query(
+            models.FactFlightSession.arr_airport_id.label("airport_id"),
+            func.count(models.FactFlightSession.session_id).label("arr_count")
+        ).filter(models.FactFlightSession.arr_airport_id.isnot(None))
+        arr_q = _apply_advanced_filters_session(arr_q, db, date_from, date_to, operator_icao, dep_icao, arr_icao, region_key)
         arr_sq = arr_q.group_by(models.FactFlightSession.arr_airport_id).subquery()
 
-        rows = (
+        main_q = (
             db.query(
                 models.DimGeography.icao_code.label("airport_icao"),
                 func.coalesce(dep_sq.c.dep_count, 0).label("as_departure"),
                 func.coalesce(arr_sq.c.arr_count, 0).label("as_arrival"),
-                (func.coalesce(dep_sq.c.dep_count, 0)
-                 + func.coalesce(arr_sq.c.arr_count, 0)).label("flight_count"),
+                (func.coalesce(dep_sq.c.dep_count, 0) + func.coalesce(arr_sq.c.arr_count, 0)).label("flight_count"),
             )
             .join(dep_sq, models.DimGeography.id == dep_sq.c.airport_id, isouter=True)
             .join(arr_sq, models.DimGeography.id == arr_sq.c.airport_id, isouter=True)
             .filter(models.DimGeography.icao_code.isnot(None))
-            .order_by(desc("flight_count"))
-            .limit(limit)
-            .all()
+            .filter(or_(dep_sq.c.dep_count > 0, arr_sq.c.arr_count > 0)) # Only airports with activity
         )
-        return [
+        
+        total = main_q.count()
+        offset = (page - 1) * limit
+        rows = main_q.order_by(desc("flight_count")).offset(offset).limit(limit).all()
+        
+        results = [
             {"airport_icao": r.airport_icao, "flight_count": r.flight_count,
              "as_departure": r.as_departure, "as_arrival": r.as_arrival}
             for r in rows
         ]
+        return total, results
 
     @staticmethod
-    def get_period_summary(db: Session, date_from: Optional[str] = None, date_to: Optional[str] = None) -> Dict[str, Any]:
-        """
-        FIX: Renamed from get_daily_summary. Now accepts a date range to aggregate stats over any period.
-        """
+    def get_period_summary(
+        db: Session, 
+        date_from: Optional[str] = None, date_to: Optional[str] = None,
+        operator_icao: Optional[str] = None, dep_icao: Optional[str] = None,
+        arr_icao: Optional[str] = None, region_key: Optional[str] = None
+    ) -> Dict[str, Any]:
+        
         q = db.query(
             func.count(models.FactFlightSession.session_id).label("total_flights"),
             func.sum(case((models.FactFlightSession.flight_status == "active", 1), else_=0)).label("active_flights"),
@@ -846,28 +829,23 @@ class AnalyticsCRUD:
             func.count(func.distinct(models.FactFlightSession.aircraft_id)).label("unique_aircraft"),
             func.count(func.distinct(models.FactFlightSession.operator_id)).label("unique_operators"),
         )
-        q = _apply_date_filter_session(q, date_from, date_to)
+        q = _apply_advanced_filters_session(q, db, date_from, date_to, operator_icao, dep_icao, arr_icao, region_key)
         agg = q.one()
 
-        events_q = db.query(func.count(models.FactAviationEvent.id)).filter(
-            models.FactAviationEvent.event_category == "EMERGENCY"
-        )
-        # Apply date filter to events manually since it uses `timestamp` not `first_seen_ts`
-        if date_from:
-            try:
-                dt_f = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                events_q = events_q.filter(models.FactAviationEvent.timestamp >= dt_f)
-            except ValueError: pass
-        if date_to:
-            try:
-                dt_t = datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
-                events_q = events_q.filter(models.FactAviationEvent.timestamp < dt_t)
-            except ValueError: pass
-            
+        # Emergency events require joining FactFlightSession to apply the same filters
+        events_q = db.query(func.count(models.FactAviationEvent.id)).join(
+            models.FactFlightSession, models.FactAviationEvent.session_id == models.FactFlightSession.session_id
+        ).filter(models.FactAviationEvent.event_category == "EMERGENCY")
+        
+        events_q = _apply_advanced_filters_session(events_q, db, date_from, date_to, operator_icao, dep_icao, arr_icao, region_key)
         emergency_events = events_q.scalar() or 0
-        top_routes = AnalyticsCRUD.get_top_routes(db, limit=5, date_from=date_from, date_to=date_to)
 
-        # Determine label
+        # Get top 5 routes for the summary
+        _, top_routes = AnalyticsCRUD.get_top_routes(
+            db, limit=5, date_from=date_from, date_to=date_to, 
+            operator_icao=operator_icao, dep_icao=dep_icao, arr_icao=arr_icao, region_key=region_key
+        )
+
         date_label = "كل الأوقات"
         if date_from and date_to: date_label = f"{date_from} إلى {date_to}"
         elif date_from: date_label = f"من {date_from}"
@@ -885,19 +863,21 @@ class AnalyticsCRUD:
         }
 
     @staticmethod
-    def get_time_distribution(db: Session, date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        NEW: Time-Series Analysis. Groups flights by the hour of the day they were first seen.
-        """
+    def get_time_distribution(
+        db: Session, 
+        date_from: Optional[str] = None, date_to: Optional[str] = None,
+        operator_icao: Optional[str] = None, dep_icao: Optional[str] = None,
+        arr_icao: Optional[str] = None, region_key: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        
         q = db.query(
             extract('hour', models.FactFlightSession.first_seen_ts).label('hour'),
             func.count(models.FactFlightSession.session_id).label('flight_count')
         )
-        q = _apply_date_filter_session(q, date_from, date_to)
+        q = _apply_advanced_filters_session(q, db, date_from, date_to, operator_icao, dep_icao, arr_icao, region_key)
         
         rows = q.group_by('hour').order_by('hour').all()
         
-        # Ensure all 24 hours are represented, even if 0
         distribution = {i: 0 for i in range(24)}
         for r in rows:
             if r.hour is not None:
@@ -907,40 +887,30 @@ class AnalyticsCRUD:
 
     @staticmethod
     def get_airline_performance(
-        db: Session,
-        limit:     int = 20,
-        date_from: Optional[str] = None,
-        date_to:   Optional[str] = None,
-        page:      int = 1,
-        page_size: int = 20,
+        db: Session, limit: int = 20, page: int = 1,
+        date_from: Optional[str] = None, date_to: Optional[str] = None,
+        operator_icao: Optional[str] = None, dep_icao: Optional[str] = None,
+        arr_icao: Optional[str] = None, region_key: Optional[str] = None
     ) -> Tuple[int, List[Dict[str, Any]]]:
+        
         q = (
             db.query(
                 models.DimOperator.icao_code.label("operator_icao"),
                 models.DimOperator.name.label("operator_name"),
                 func.count(models.FactFlightSession.session_id).label("total_flights"),
-                func.sum(case(
-                    (models.FactFlightSession.flight_status == "active", 1), else_=0
-                )).label("active_flights"),
-                func.avg(
-                    func.extract(
-                        "epoch",
-                        models.FactFlightSession.last_seen_ts
-                        - models.FactFlightSession.first_seen_ts,
-                    )
-                ).label("avg_duration_s"),
+                func.sum(case((models.FactFlightSession.flight_status == "active", 1), else_=0)).label("active_flights"),
+                func.avg(func.extract("epoch", models.FactFlightSession.last_seen_ts - models.FactFlightSession.first_seen_ts)).label("avg_duration_s"),
                 func.sum(models.FactFlightSession.total_distance_km).label("total_distance_km"),
             )
-            .join(models.DimOperator,
-                  models.FactFlightSession.operator_id == models.DimOperator.id)
+            .join(models.DimOperator, models.FactFlightSession.operator_id == models.DimOperator.id)
             .filter(models.FactFlightSession.operator_id.isnot(None))
         )
-        q = _apply_date_filter_session(q, date_from, date_to)
+        q = _apply_advanced_filters_session(q, db, date_from, date_to, operator_icao, dep_icao, arr_icao, region_key)
         q = q.group_by(models.DimOperator.icao_code, models.DimOperator.name)
 
         total  = q.count()
-        offset = (page - 1) * page_size
-        rows   = q.order_by(desc("total_flights")).offset(offset).limit(page_size).all()
+        offset = (page - 1) * limit
+        rows   = q.order_by(desc("total_flights")).offset(offset).limit(limit).all()
 
         results = [
             {
@@ -948,12 +918,8 @@ class AnalyticsCRUD:
                 "operator_name":           r.operator_name,
                 "total_flights":           r.total_flights,
                 "active_flights":          int(r.active_flights or 0),
-                "avg_flight_duration_min": (
-                    round(float(r.avg_duration_s) / 60, 1) if r.avg_duration_s else None
-                ),
-                "total_distance_km": (
-                    round(float(r.total_distance_km), 1) if r.total_distance_km else None
-                ),
+                "avg_flight_duration_min": round(float(r.avg_duration_s) / 60, 1) if r.avg_duration_s else None,
+                "total_distance_km":       round(float(r.total_distance_km), 1) if r.total_distance_km else None,
             }
             for r in rows
         ]
@@ -1039,28 +1005,3 @@ class IngestionJobCRUD:
     @staticmethod
     def get_job(db: Session, job_id: int) -> Optional[models.IngestionJob]:
         return db.query(models.IngestionJob).filter(models.IngestionJob.id == job_id).first()
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# MODULE-LEVEL HELPERS (shared across classes)
-# ═════════════════════════════════════════════════════════════════════════════
-
-def _apply_date_filter(q, date_from: Optional[str], date_to: Optional[str]):
-    return _apply_date_filter_session(q, date_from, date_to)
-
-
-def _apply_date_filter_session(q, date_from: Optional[str], date_to: Optional[str]):
-    if date_from:
-        try:
-            dt = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            q  = q.filter(models.FactFlightSession.first_seen_ts >= dt)
-        except ValueError:
-            pass
-    if date_to:
-        try:
-            dt = datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            dt = dt + timedelta(days=1)
-            q  = q.filter(models.FactFlightSession.first_seen_ts < dt)
-        except ValueError:
-            pass
-    return q
