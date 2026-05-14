@@ -2,11 +2,11 @@
  * HistorySection.tsx — v2.0 (Entity Intelligence Dashboard)
  *
  * CHANGES:
- * - Transformed from a simple data table into a rich Entity Intelligence Dashboard.
- * - Added Flight Status Distribution chart (PieChart).
- * - Improved Top Routes chart (removed hardcoded slicing, better UI).
- * - Enhanced Stats Cards to highlight Distance and Duration metrics.
- * - Improved table readability and styling.
+ * - Transformed from a simple table view into a rich Entity Dashboard.
+ * - Added Flight Status Distribution PieChart.
+ * - Improved Top Routes BarChart (removed hardcoded slicing).
+ * - Upgraded Stats Cards for better visual hierarchy.
+ * - Enhanced table formatting and pagination controls.
  */
 import { useState, useCallback } from 'react';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
@@ -29,12 +29,12 @@ import type {
   FlightSearchItem, RouteStats,
 } from '@/types';
 
-const ENTITY_META: Record<HistoryEntityType, { label: string; placeholder: string; example: string }> = {
-  aircraft: { label: 'ICAO24 الطائرة',  placeholder: 'مثال: 710a1b', example: '710a1b' },
-  airport:  { label: 'كود المطار',      placeholder: 'مثال: OERK أو RUH', example: 'OERK' },
-  airline:  { label: 'كود الناقل ICAO', placeholder: 'مثال: SVA', example: 'SVA' },
-  country:  { label: 'رمز الدولة',      placeholder: 'مثال: SA أو AE', example: 'SA' },
-  region:   { label: 'مفتاح المنطقة',   placeholder: 'مثال: middle_east', example: 'middle_east' },
+const ENTITY_META: Record<HistoryEntityType, { label: string; placeholder: string; example: string; icon: string }> = {
+  aircraft: { label: 'ICAO24 الطائرة',  placeholder: 'مثال: 710a1b', example: '710a1b', icon: '✈️' },
+  airport:  { label: 'كود المطار',      placeholder: 'مثال: OERK أو RUH', example: 'OERK', icon: '🛫' },
+  airline:  { label: 'كود الناقل ICAO', placeholder: 'مثال: SVA', example: 'SVA', icon: '🏢' },
+  country:  { label: 'رمز الدولة',      placeholder: 'مثال: SA أو AE', example: 'SA', icon: '🌍' },
+  region:   { label: 'مفتاح المنطقة',   placeholder: 'مثال: middle_east', example: 'middle_east', icon: '🗺️' },
 };
 
 const COLORS = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4'];
@@ -42,7 +42,7 @@ const STATUS_COLORS: Record<string, string> = {
   'completed': '#10b981', // Green
   'landed': '#3b82f6',    // Blue
   'active': '#f59e0b',    // Yellow
-  'lost_signal': '#ef4444' // Red
+  'lost_signal': '#ef4444'// Red
 };
 
 export function HistorySection() {
@@ -98,13 +98,13 @@ export function HistorySection() {
       active: 'نشطة', landed: 'هبطت',
       lost_signal: 'انقطع الاتصال', completed: 'مكتملة',
     };
-    return map[s || ''] || s || 'غير معروف';
+    return map[s || ''] || s || '—';
   };
 
   // Calculate status distribution for the pie chart based on the current page data
   // (Ideally this would come from the backend aggregations, but we use page data as a proxy for now)
-  const statusDistribution = response?.data.reduce((acc, flight) => {
-    const status = flight.flight_status || 'unknown';
+  const statusDistribution = response?.data.reduce((acc, curr) => {
+    const status = curr.flight_status || 'unknown';
     acc[status] = (acc[status] || 0) + 1;
     return acc;
   }, {} as Record<string, number>);
@@ -122,7 +122,7 @@ export function HistorySection() {
       <Card className="border-primary/10 shadow-sm">
         <CardHeader className="pb-2">
           <CardTitle className="text-base flex items-center gap-2">
-            <span>🔍</span> محدد الكيان (Entity Selector)
+            <span>🔍</span> محددات الاستعلام
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-6">
@@ -171,7 +171,7 @@ export function HistorySection() {
 
           <div className="flex flex-col sm:flex-row justify-between items-center pt-4 border-t gap-4">
             <p className="text-xs text-muted-foreground">
-              مثال: ابحث عن {meta.label} <code className="bg-muted px-1 py-0.5 rounded">{meta.example}</code>
+              مثال: ابحث عن {meta.label} <code className="bg-muted px-1 rounded">{meta.example}</code>
             </p>
             <div className="flex gap-2 w-full sm:w-auto">
               {response && response.total > 0 && (
@@ -187,27 +187,25 @@ export function HistorySection() {
         </CardContent>
       </Card>
 
-      {/* ── Aggregations & Visuals ───────────────────────────────────────── */}
+      {/* ── Entity Intelligence Dashboard ─────────────────────────────────── */}
       {response?.aggregations && (
         <div className="space-y-6 animate-in fade-in duration-500">
           
+          {/* Entity Header */}
+          <div className="flex items-center gap-4 pb-2 border-b">
+            <div className="text-4xl bg-primary/10 p-3 rounded-xl">{meta.icon}</div>
+            <div>
+              <h2 className="text-2xl font-bold font-mono tracking-wider">{response.entity_id}</h2>
+              <p className="text-muted-foreground text-sm">تقرير استخباراتي لـ {meta.label}</p>
+            </div>
+          </div>
+
           {/* Stats Cards */}
           <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
-            {/* Context Card */}
-            <Card className="border-none shadow-sm bg-primary/5">
-              <CardContent className="p-4 flex flex-col justify-center h-full">
-                <div className="text-2xl mb-2">📄</div>
-                <div className="text-sm text-muted-foreground mb-1">الكيان المستهدف</div>
-                <div className="font-bold text-lg text-primary truncate" dir="ltr">{response.entity_id}</div>
-                <div className="text-xs text-muted-foreground mt-2">
-                  صفحة {response.page} من {response.pages}
-                </div>
-              </CardContent>
-            </Card>
-
             {[
               ['إجمالي الرحلات',   response.aggregations.total_flights,    '✈️', 'text-blue-600'],
               ['طائرات فريدة',    response.aggregations.unique_aircraft,  '🛩️', 'text-purple-600'],
+              ['ناقلون فريدون',   response.aggregations.unique_operators, '🏢', 'text-amber-600'],
               ['إجمالي المسافة',
                response.aggregations.total_distance_km != null
                  ? `${Math.round(response.aggregations.total_distance_km).toLocaleString('ar')} كم`
@@ -215,12 +213,12 @@ export function HistorySection() {
               ['متوسط المدة',
                response.aggregations.avg_duration_min != null
                  ? `${Math.round(response.aggregations.avg_duration_min).toLocaleString('ar')} د`
-                 : '—', '⏱️', 'text-amber-600'],
+                 : '—', '⏱️', 'text-rose-600'],
             ].map(([label, value, icon, colorClass]) => (
-              <Card key={label as string} className="border-none shadow-sm hover:shadow-md transition-shadow">
-                <CardContent className="p-4 flex flex-col items-center text-center h-full justify-center">
+              <Card key={label as string} className="border-none shadow-sm bg-card hover:shadow-md transition-shadow">
+                <CardContent className="p-4 flex flex-col items-center text-center">
                   <div className="text-2xl mb-2">{icon}</div>
-                  <div className={`text-2xl font-bold ${colorClass}`}>
+                  <div className={`text-xl font-bold ${colorClass}`}>
                     {typeof value === 'number' ? value.toLocaleString('ar') : value}
                   </div>
                   <div className="text-xs text-muted-foreground mt-1 font-medium">{label}</div>
@@ -230,17 +228,17 @@ export function HistorySection() {
           </div>
 
           {/* Charts Row */}
-          <div className="grid gap-6 lg:grid-cols-3">
+          <div className="grid gap-6 lg:grid-cols-2">
             
             {/* Top Routes Chart */}
             {response.aggregations.top_routes.length > 0 && (
-              <Card className="lg:col-span-2 border-none shadow-sm">
-                <CardHeader className="pb-2">
+              <Card className="border-none shadow-sm">
+                <CardHeader>
                   <CardTitle className="text-lg">🛤️ أبرز الطرق الجوية للكيان</CardTitle>
-                  <CardDescription>أكثر المسارات تكراراً بناءً على نتائج البحث</CardDescription>
+                  <CardDescription>أكثر المسارات استخداماً بناءً على نتائج الاستعلام</CardDescription>
                 </CardHeader>
                 <CardContent>
-                  <ResponsiveContainer width="100%" height={250}>
+                  <ResponsiveContainer width="100%" height={280}>
                     <BarChart
                       data={response.aggregations.top_routes.map((r: RouteStats) => ({
                         route:  `${r.departure}←${r.arrival}`,
@@ -257,7 +255,7 @@ export function HistorySection() {
                         formatter={(v: number) => [v.toLocaleString('ar'), 'رحلات']}
                         cursor={{ fill: 'var(--muted)' }}
                       />
-                      <Bar dataKey="رحلات" radius={[0, 4, 4, 0]} barSize={20}>
+                      <Bar dataKey="رحلات" radius={[0, 4, 4, 0]} barSize={25}>
                         {response.aggregations.top_routes.map((_: RouteStats, i: number) => (
                           <Cell key={i} fill={COLORS[i % COLORS.length]} />
                         ))}
@@ -268,29 +266,28 @@ export function HistorySection() {
               </Card>
             )}
 
-            {/* Status Distribution Chart (NEW) */}
+            {/* Status Distribution Chart */}
             {pieData.length > 0 && (
               <Card className="border-none shadow-sm">
-                <CardHeader className="pb-2">
+                <CardHeader>
                   <CardTitle className="text-lg">📊 توزيع حالات الرحلات</CardTitle>
-                  <CardDescription>بناءً على الصفحة الحالية</CardDescription>
+                  <CardDescription>حالة الرحلات المعروضة في الصفحة الحالية</CardDescription>
                 </CardHeader>
                 <CardContent>
-                  <ResponsiveContainer width="100%" height={250}>
+                  <ResponsiveContainer width="100%" height={280}>
                     <PieChart>
                       <Pie
                         data={pieData}
                         dataKey="value"
                         nameKey="name"
                         cx="50%" cy="50%" 
-                        innerRadius={40}
-                        outerRadius={80}
+                        innerRadius={60}
+                        outerRadius={100}
                         paddingAngle={2}
                         label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
-                        labelLine={false}
                       >
-                        {pieData.map((entry, i) => (
-                          <Cell key={i} fill={STATUS_COLORS[entry.originalKey] || COLORS[i % COLORS.length]} />
+                        {pieData.map((entry, index) => (
+                          <Cell key={`cell-${index}`} fill={STATUS_COLORS[entry.originalKey] || COLORS[index % COLORS.length]} />
                         ))}
                       </Pie>
                       <Tooltip
@@ -308,34 +305,44 @@ export function HistorySection() {
 
       {/* ── Results Table ─────────────────────────────────────────────────── */}
       {response && (
-        <Card className="border-none shadow-sm animate-in fade-in duration-500">
-          <CardHeader className="pb-4 border-b">
+        <Card className="border-none shadow-sm animate-in fade-in duration-500 delay-150">
+          <CardHeader className="pb-4 border-b mb-4">
             <div className="flex items-center justify-between">
               <CardTitle className="text-lg flex items-center gap-2">
-                <span>📋</span> سجل الرحلات التفصيلي
-                <Badge variant="secondary" className="mr-2 bg-primary/10 text-primary hover:bg-primary/20">
+                <span>📄</span> سجل الرحلات التفصيلي
+                <Badge variant="secondary" className="mr-2 text-sm">
                   {response.total.toLocaleString('ar')} رحلة
                 </Badge>
               </CardTitle>
+              {response.pages > 1 && (
+                <div className="flex items-center gap-3 text-sm bg-muted/50 px-3 py-1 rounded-lg">
+                  <Button size="sm" variant="ghost" className="h-7 px-2"
+                    disabled={page <= 1 || loading} onClick={() => executeQuery(page - 1)}>السابق</Button>
+                  <span className="text-muted-foreground font-medium">
+                    {page} / {response.pages}
+                  </span>
+                  <Button size="sm" variant="ghost" className="h-7 px-2"
+                    disabled={page >= response.pages || loading} onClick={() => executeQuery(page + 1)}>التالي</Button>
+                </div>
+              )}
             </div>
           </CardHeader>
-          <CardContent className="pt-0 p-0">
+          <CardContent>
             {response.data.length === 0 ? (
-              <div className="text-center py-16 text-muted-foreground bg-muted/10">
+              <div className="text-center py-16 text-muted-foreground bg-muted/20 rounded-lg border border-dashed">
                 <span className="text-5xl block mb-4 opacity-50">📭</span>
-                <p className="text-lg font-medium">لا توجد رحلات مطابقة</p>
-                <p className="text-sm opacity-70">حاول تغيير الكيان أو النطاق الزمني</p>
+                <p className="text-base font-medium">لا توجد رحلات مطابقة</p>
+                <p className="text-sm opacity-70">حاول تغيير النطاق الزمني أو المعرّف</p>
               </div>
             ) : (
-              <div className="overflow-auto">
+              <div className="overflow-auto rounded-lg border">
                 <table className="w-full text-sm">
-                  <thead className="bg-muted/50 sticky top-0">
+                  <thead className="bg-muted/50">
                     <tr>
                       <th className="p-3 text-right font-medium whitespace-nowrap">رمز الاستدعاء</th>
                       <th className="p-3 text-right font-medium whitespace-nowrap">الناقل</th>
                       <th className="p-3 text-right font-medium whitespace-nowrap">الطائرة</th>
-                      <th className="p-3 text-right font-medium whitespace-nowrap">المغادرة</th>
-                      <th className="p-3 text-right font-medium whitespace-nowrap">الوصول</th>
+                      <th className="p-3 text-right font-medium whitespace-nowrap">المسار</th>
                       <th className="p-3 text-right font-medium whitespace-nowrap">وقت الإقلاع</th>
                       <th className="p-3 text-right font-medium whitespace-nowrap">المدة</th>
                       <th className="p-3 text-right font-medium whitespace-nowrap">المسافة</th>
@@ -357,16 +364,13 @@ export function HistorySection() {
                         <td className="p-3 font-mono text-xs">
                           {f.aircraft?.icao24 || '—'}
                           {f.aircraft?.type_code && (
-                            <Badge variant="outline" className="mr-2 text-[10px] py-0 h-4 bg-background">
+                            <Badge variant="outline" className="mr-2 text-xs py-0 h-5 bg-background">
                               {f.aircraft.type_code}
                             </Badge>
                           )}
                         </td>
-                        <td className="p-3 font-mono font-bold text-primary text-base">
-                          {f.dep_airport?.icao_code || '—'}
-                        </td>
-                        <td className="p-3 font-mono font-bold text-primary text-base">
-                          {f.arr_airport?.icao_code || '—'}
+                        <td className="p-3 font-mono font-bold text-primary">
+                          {f.dep_airport?.icao_code || '??'} <span className="text-muted-foreground font-normal mx-1">←</span> {f.arr_airport?.icao_code || '??'}
                         </td>
                         <td className="p-3 text-xs text-muted-foreground whitespace-nowrap">
                           {f.actual_takeoff_ts || f.first_seen_ts
@@ -375,20 +379,13 @@ export function HistorySection() {
                               })
                             : '—'}
                         </td>
-                        <td className="p-3 text-sm font-medium">{durStr(f)}</td>
-                        <td className="p-3 text-sm font-medium">
+                        <td className="p-3 text-xs font-medium">{durStr(f)}</td>
+                        <td className="p-3 text-xs font-medium">
                           {f.total_distance_km != null
                             ? `${Math.round(f.total_distance_km).toLocaleString('ar')} كم` : '—'}
                         </td>
                         <td className="p-3">
-                          <Badge 
-                            variant="outline" 
-                            style={{ 
-                              borderColor: STATUS_COLORS[f.flight_status || ''] || '#ccc',
-                              color: STATUS_COLORS[f.flight_status || ''] || '#666',
-                              backgroundColor: `${STATUS_COLORS[f.flight_status || ''] || '#ccc'}15`
-                            }}
-                          >
+                          <Badge variant="outline" style={{ borderColor: STATUS_COLORS[f.flight_status || ''] || '#ccc', color: STATUS_COLORS[f.flight_status || ''] || '#666' }}>
                             {statusLabel(f.flight_status)}
                           </Badge>
                         </td>
@@ -396,21 +393,6 @@ export function HistorySection() {
                     ))}
                   </tbody>
                 </table>
-              </div>
-            )}
-            
-            {/* Pagination Controls */}
-            {response.pages > 1 && (
-              <div className="flex items-center justify-between p-4 border-t bg-muted/10">
-                <Button variant="outline" size="sm" disabled={page <= 1 || loading} onClick={() => executeQuery(page - 1)}>
-                  السابق
-                </Button>
-                <span className="text-sm font-medium text-muted-foreground">
-                  صفحة {page} من {response.pages}
-                </span>
-                <Button variant="outline" size="sm" disabled={page >= response.pages || loading} onClick={() => executeQuery(page + 1)}>
-                  التالي
-                </Button>
               </div>
             )}
           </CardContent>
